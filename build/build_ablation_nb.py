@@ -79,15 +79,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("PyTorch:", torch.__version__, "| timm:", timm.__version__, "| Device:", device)""")
 
 md(r"""## 1 · Configuration
-Adjust `ROOT` to point at your dataset (the same `digitalknee_processed` folder used in the
-reference notebooks). The folder must contain `train/`, `val/`, `test/` sub-folders, each with the
-five KL-grade class folders.
+Adjust `ROOT` to point at your dataset. **For a valid ablation this must be the raw/original split
+(`digitalknee_split`), not an already contrast-enhanced/cropped folder** — otherwise the
+"+preprocessing" config double-processes the images and accuracy will *drop*. The folder must
+contain `train/`, `val/`, `test/` sub-folders, each with the five KL-grade class folders.
 
 * Set `QUICK_TEST = True` for a fast pipeline smoke-test (few epochs, subset) before the full run.
 * Set `QUICK_TEST = False` to reproduce the paper numbers (≤200 epochs, early stopping).""")
 
 co(r"""# ------------------- USER CONFIG -------------------
-ROOT        = "/content/drive/MyDrive/digitalknee_processed"   # dataset root (train/val/test inside)
+ROOT        = "/content/drive/MyDrive/digitalknee_split"   # dataset root (train/val/test inside)
 RESULTS_DIR = "/content/drive/MyDrive/OA_ablation_results"     # where figures/tables are saved
 
 labels      = ['0Normal', '1Doubtful', '2Mild', '3Moderate', '4Severe']

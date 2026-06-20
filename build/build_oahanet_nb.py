@@ -76,7 +76,7 @@ Identical preprocessing (contrast-oriented) and class-weighting as the winning c
 the ablation study — these are *embedded* in OA-HANet rather than ablated.""")
 
 co(r"""# ------------------- USER CONFIG -------------------
-ROOT        = "/content/drive/MyDrive/digitalknee_processed"
+ROOT        = "/content/drive/MyDrive/digitalknee_split"
 RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_results"
 
 labels      = ['0Normal', '1Doubtful', '2Mild', '3Moderate', '4Severe']
