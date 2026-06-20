@@ -1,12 +1,8 @@
 # OA Analysis — Knee Osteoarthritis KL Grading
 
-Reproducible code and proof artefacts for the PhD work
+Reproducible code for the PhD work
 **“Deep Learning Techniques for the Diagnosis and Detection of Different Types of Orthopedic
 Conditions”** (Poojan Shah, 24RCP004, Pandit Deendayal Energy University).
-
-This repository backs the DC-5 presentation results so that any journal reviewer can be shown
-reproducible proof of the **ablation study**, the **top-3 model evaluation**, the **Grad-CAM
-explainability**, and the **proposed novel architecture (OA-HANet)**.
 
 ---
 
