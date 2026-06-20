@@ -10,10 +10,11 @@ Conditions”** (Poojan Shah, 24RCP004, Pandit Deendayal Energy University).
 
 * **Digital Knee X-ray** — Mendeley Data, V1, doi: [10.17632/56rmx5bjcr.1](https://data.mendeley.com/datasets/56rmx5bjcr/1)
   (3,300 radiographs, KL grades 0–4, labelled by 2 medical experts).
-* Expected layout on Google Drive (same as the reference notebooks):
+* Expected layout on Google Drive — use the **raw/original split** so the ablation's
+  "+preprocessing" stage is applied once (not on top of already-processed images):
 
 ```
-/content/drive/MyDrive/digitalknee_processed/
+/content/drive/MyDrive/digitalknee_split/
 ├── train/   ├── 0Normal/ 1Doubtful/ 2Mild/ 3Moderate/ 4Severe/
 ├── val/     └── (same 5 class folders)
 └── test/        (same 5 class folders)
