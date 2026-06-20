@@ -93,7 +93,7 @@ RESULTS_DIR = "/content/drive/MyDrive/OA_ablation_results"     # where figures/t
 labels      = ['0Normal', '1Doubtful', '2Mild', '3Moderate', '4Severe']
 num_classes = len(labels)
 img_size    = 224
-batch_size  = 32
+batch_size  = 32          # swin_base is ~88M params; lower to 16 if a smaller GPU (e.g. T4) OOMs
 seed        = 42
 
 # Training schedule (matches DC-5 setup: Adam 1e-4, batch 32, <=200 epochs, early stop patience 20)
@@ -264,7 +264,7 @@ md(r"""## 5 · Model factory (timm)
 
 | short name | timm model | params |
 |------------|-----------|--------|
-| `swin`     | `swin_tiny_patch4_window7_224` | ~28 M |
+| `swin`     | `swin_base_patch4_window7_224` | ~88 M |
 | `resnet101`| `resnet101`                    | ~44 M |
 | `vgg16`    | `vgg16`                        | ~138 M |
 
@@ -272,7 +272,7 @@ All backbones are ImageNet-pretrained and **fully fine-tuned** at lr `1e-4`
 (identical protocol across models, consistent with the Swin reference notebook).""")
 
 co(r"""TIMM_NAMES = {
-    "swin":      "swin_tiny_patch4_window7_224",
+    "swin":      "swin_base_patch4_window7_224",
     "resnet101": "resnet101",
     "vgg16":     "vgg16",
 }

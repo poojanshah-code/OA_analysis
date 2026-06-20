@@ -157,7 +157,7 @@ print("Class weights:", {labels[i]: round(float(class_w[i]), 3) for i in range(n
 
 md(r"""## 2 · OA-HANet architecture
 
-* **Swin backbone** (`swin_tiny_patch4_window7_224`, `num_classes=0`) → global token map `(B,7,7,768)`.
+* **Swin backbone** (`swin_base_patch4_window7_224`, `num_classes=0`) → global token map `(B,7,7,1024)`.
 * **Multi-scale CNN reuse branch** (`densenet121` features, dense connectivity) → local map `(B,1024,7,7)`.
 * Both projected to a common dim *d=256* and treated as token sequences (49 tokens each).
 * **Cross-attention fusion**: Swin global tokens are *queries*, CNN local tokens are *keys/values*,
@@ -184,7 +184,7 @@ co(r"""class CrossAttentionFusion(nn.Module):
 
 class OA_HANet(nn.Module):
     def __init__(self, num_classes=5, d=256,
-                 swin_name="swin_tiny_patch4_window7_224",
+                 swin_name="swin_base_patch4_window7_224",
                  cnn_name="densenet121", pretrained=True):
         super().__init__()
         # global branch
