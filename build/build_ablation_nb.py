@@ -72,7 +72,8 @@ import torchvision.transforms as T
 import timm
 
 from sklearn.metrics import (confusion_matrix, classification_report,
-                             accuracy_score, precision_recall_fscore_support)
+                             accuracy_score, balanced_accuracy_score,
+                             f1_score, recall_score, precision_recall_fscore_support)
 from sklearn.utils.class_weight import compute_class_weight
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -147,7 +148,10 @@ co(r"""def auto_knee_crop(gray):
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return cl
+    H, W = gray.shape[:2]
     x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+    if w * h < 0.15 * H * W:          # reject tiny/degenerate crops -> keep full CLAHE image
+        return cl
     px, py = int(0.08 * w), int(0.10 * h)
     x1, y1 = max(0, x - px), max(0, y - py)
     x2, y2 = min(gray.shape[1], x + w + px), min(gray.shape[0], y + h + py)
@@ -510,36 +514,53 @@ def run_gradcam(model, model_name, loader, preprocess, n=6):
 
 md(r"""## 10 · Ablation summary helper""")
 
-co(r"""def ablation_summary(model_name, results):
-    rows, prev = [], None
-    order = ["baseline", "preproc", "preproc_weighted"]
+co(r"""def _metrics(res):
+    yt, yp = res["y_true"], res["y_pred"]
+    return dict(
+        acc  = accuracy_score(yt, yp) * 100,
+        bacc = balanced_accuracy_score(yt, yp) * 100,
+        mf1  = f1_score(yt, yp, average="macro", zero_division=0) * 100,
+        g1   = recall_score(yt, yp, labels=[1], average="macro", zero_division=0) * 100,
+    )
+
+def ablation_summary(model_name, results):
+    # NOTE: overall Accuracy can stay flat or dip when class-weighting is added; the benefit of
+    # weighting shows in Balanced Accuracy / Macro-F1 / minority-grade (G1) recall. All are reported.
+    order  = ["baseline", "preproc", "preproc_weighted"]
     pretty = {"baseline": "Baseline (no preproc, no weighting)",
               "preproc": "+ Contrast-oriented preprocessing",
               "preproc_weighted": "+ Inverse-frequency class weighting"}
+    rows, prev = [], None
     for c in order:
-        acc = results[c]["test_acc"] * 100
-        delta = "" if prev is None else f"+{acc - prev:.2f}"
-        rows.append([pretty[c], f"{acc:.2f}", delta]); prev = acc
-    df = pd.DataFrame(rows, columns=["Configuration", "Accuracy (%)", "Δ"])
+        m = _metrics(results[c])
+        d = "" if prev is None else f"{m['acc'] - prev:+.2f}"
+        rows.append([pretty[c], f"{m['acc']:.2f}", f"{m['bacc']:.2f}",
+                     f"{m['mf1']:.2f}", f"{m['g1']:.2f}", d]); prev = m["acc"]
+    df = pd.DataFrame(rows, columns=["Configuration", "Accuracy (%)", "Balanced Acc (%)",
+                                     "Macro-F1 (%)", "G1 Recall (%)", "ΔAcc"])
     print(f"\n### Ablation summary — {model_name}")
     print(df.to_string(index=False))
     df.to_csv(os.path.join(RESULTS_DIR, f"{model_name}_ablation_summary.csv"), index=False)
 
-    # bar chart
-    accs = [results[c]["test_acc"] * 100 for c in order]
-    plt.figure(figsize=(7, 4.5))
-    bars = plt.bar([pretty[c].replace("+ ", "+\n") for c in order], accs,
-                   color=["#9ecae1", "#4292c6", "#08519c"])
-    for b, a in zip(bars, accs):
-        plt.text(b.get_x() + b.get_width()/2, a + 0.2, f"{a:.2f}", ha="center", fontweight="bold")
-    plt.ylabel("Test Accuracy (%)"); plt.title(f"Component-wise Ablation — {model_name}")
-    plt.ylim(min(accs) - 3, max(accs) + 3)
+    # grouped bar chart: Accuracy vs Macro-F1 across the three configs
+    accs = [_metrics(results[c])["acc"] for c in order]
+    mf1s = [_metrics(results[c])["mf1"] for c in order]
+    xlab = ["Baseline", "+Preproc", "+Preproc\n+Weights"]; xpos = np.arange(len(order))
+    plt.figure(figsize=(8, 4.5))
+    plt.bar(xpos - 0.2, accs, width=0.4, label="Accuracy", color="#08519c")
+    plt.bar(xpos + 0.2, mf1s, width=0.4, label="Macro-F1", color="#fdae6b")
+    for x, a, f in zip(xpos, accs, mf1s):
+        plt.text(x - 0.2, a + 0.2, f"{a:.1f}", ha="center", fontsize=9, fontweight="bold")
+        plt.text(x + 0.2, f + 0.2, f"{f:.1f}", ha="center", fontsize=9, fontweight="bold")
+    plt.xticks(xpos, xlab); plt.ylabel("%"); plt.legend()
+    plt.title(f"Component-wise Ablation — {model_name}")
+    plt.ylim(min(accs + mf1s) - 4, max(accs + mf1s) + 4)
     plt.tight_layout(); plt.savefig(os.path.join(RESULTS_DIR, f"{model_name}_ablation_bar.png"), dpi=160, bbox_inches="tight"); plt.show()
 
     # table image
-    fig, ax = plt.subplots(figsize=(8, 1.6)); ax.axis("off")
+    fig, ax = plt.subplots(figsize=(10, 1.8)); ax.axis("off")
     tbl = ax.table(cellText=df.values, colLabels=df.columns, loc="center", cellLoc="center")
-    tbl.auto_set_font_size(False); tbl.set_fontsize(11); tbl.scale(1, 1.6)
+    tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1, 1.6)
     ax.set_title(f"Ablation Study — {model_name}", fontweight="bold")
     plt.tight_layout(); plt.savefig(os.path.join(RESULTS_DIR, f"{model_name}_ablation_table.png"), dpi=160, bbox_inches="tight"); plt.show()
     return df""")
@@ -548,7 +569,15 @@ md(r"""# STEP 1 — Swin Transformer ablation
 Runs the three configurations, prints epoch tables / learning curves / confusion matrices /
 classification reports, then summarises the ablation and renders Grad-CAM for the best model.
 
-> Expected trend (DC-5 slide 65): Baseline ≈ 87.6 % → + Preprocessing ≈ 90.2 % → + Weighting ≈ 93.58 %.""")
+> **Important — run on the RAW split (`digitalknee_split`).** The ablation only works if the
+> baseline sees un-enhanced, un-cropped images. If `ROOT` points at an already preprocessed folder,
+> the "+preprocessing" config applies CLAHE/crop a second time and accuracy will *drop* instead of
+> rise. Verify with the Section-2 sanity-check image (baseline should look like a full grayscale
+> radiograph, not a tight high-contrast crop).
+>
+> Expected trend (DC-5 slide 65): Baseline ≈ 87.6 % → + Preprocessing ≈ 90.2 % → + Weighting ≈ 93.58 %.
+> Class-weighting's gain is clearest in **Balanced Accuracy / Macro-F1 / G1 recall** (all in the
+> summary table), since it trades a little majority-class accuracy for minority-grade sensitivity.""")
 
 co(r"""swin_results = {}
 for cfg in ["baseline", "preproc", "preproc_weighted"]:

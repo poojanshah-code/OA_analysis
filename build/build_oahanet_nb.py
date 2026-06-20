@@ -110,7 +110,9 @@ co(r"""def auto_knee_crop(gray):
     closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k)
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts: return cl
+    H, W = gray.shape[:2]
     x, y, w, h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+    if w * h < 0.15 * H * W: return cl       # reject tiny/degenerate crops -> keep full CLAHE image
     px, py = int(0.08 * w), int(0.10 * h)
     x1, y1 = max(0, x - px), max(0, y - py)
     x2, y2 = min(gray.shape[1], x + w + px), min(gray.shape[0], y + h + py)
