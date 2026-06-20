@@ -101,6 +101,8 @@ if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]; IMAGENET_STD = [0.229, 0.224, 0.225]""")
 
 co(r"""def auto_knee_crop(gray):
+    if gray.dtype != np.uint8:                       # 16-bit X-rays -> 8-bit (Otsu/contours need CV_8UC1)
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)); cl = clahe.apply(gray)
     blur = cv2.GaussianBlur(cl, (5, 5), 0)
     _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -119,6 +121,8 @@ def load_image(path, preprocess=True):
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None: raise FileNotFoundError(path)
     gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    if gray.dtype != np.uint8:                       # normalise 16-bit -> 8-bit grayscale
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     if preprocess: gray = auto_knee_crop(gray)
     return np.stack([gray, gray, gray], axis=-1)
 

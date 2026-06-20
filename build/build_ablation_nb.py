@@ -136,6 +136,8 @@ When `preprocess=False` (the **baseline**) the image is only read and stacked to
 
 co(r"""def auto_knee_crop(gray):
     # CLAHE + Otsu + largest-contour bounding-box crop. Returns the cropped grayscale ROI.
+    if gray.dtype != np.uint8:                       # 16-bit X-rays -> 8-bit (Otsu/contours need CV_8UC1)
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     cl    = clahe.apply(gray)
     blur  = cv2.GaussianBlur(cl, (5, 5), 0)
@@ -164,6 +166,8 @@ def load_image(path, preprocess):
         gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
     else:
         gray = img
+    if gray.dtype != np.uint8:                       # normalise 16-bit -> 8-bit grayscale
+        gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     if preprocess:
         gray = auto_knee_crop(gray)
     return np.stack([gray, gray, gray], axis=-1)  # HxWx3 uint8
