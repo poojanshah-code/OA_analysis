@@ -1,0 +1,15 @@
+# Core deep-learning stack (pinned to match the reference Colab environment)
+timm==0.9.2
+torch>=2.0
+torchvision>=0.15
+grad-cam>=1.5.0
+
+# Data / metrics / plotting
+numpy
+pandas
+scikit-learn
+opencv-python-headless
+matplotlib
+seaborn
+tqdm
+Pillow
