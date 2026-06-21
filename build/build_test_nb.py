@@ -17,13 +17,21 @@ Loads your saved weights from `MyDrive/main_weights` and runs **inference only**
 (five KL-grade folders), producing per-model **confusion matrix** + **classification report**, and
 cross-model comparison charts/tables.
 
-**Robustness built in (because saved models can differ in how they were preprocessed):**
-* **Auto input-matching** — for each model the notebook tries a few input pipelines
-  (raw vs CLAHE+crop preprocessing × ImageNet-normalise vs `/255` scaling) and, for OA-HANet, both
-  the ordinal and softmax decoders, then keeps the configuration that gives the best accuracy and
-  prints the full sweep so you can see which preprocessing your model was trained with.
-* **Mixed frameworks** — OA-HANet/Swin/ResNet-101 are PyTorch `.pth`; **VGG-16 is a Keras `.h5`**
-  loaded via **legacy Keras** (`tf-keras`) so old `.h5` files deserialize correctly under TF 2.20.
+**Per-model training recipes (from your reference notebooks — matched here):**
+
+| Model | Framework | Preprocessing | Normalization | Head / decode |
+|-------|-----------|---------------|---------------|---------------|
+| Swin | PyTorch `swin_base` (`swin_base_best.pth`) | CLAHE + ROI crop | **0.485/0.229 all channels** (`gray`) | softmax |
+| OA-HANet | PyTorch (this class) | CLAHE + ROI crop | ImageNet | ordinal (CORAL) |
+| ResNet-101 | Keras **ResNet101V2** | `rescale 1./255` | `/255` | Dropout 0.25 |
+| VGG-16 | Keras `VGG16` | `rescale 1./255` | `/255` | Dropout 0.4 |
+
+**Robustness built in:**
+* **Framework auto-detected by file extension** — `.h5/.keras` → TensorFlow (legacy `tf-keras`,
+  rebuilding the exact ResNet101V2 / VGG16 architecture if it is a weights-only file); `.pth` → PyTorch.
+* **Auto input-matching** — each model is evaluated under several input pipelines
+  (raw vs CLAHE+crop × `gray`/ImageNet/`scale` normalisation) and, for OA-HANet, ordinal vs softmax
+  decode; the best is kept and the **full sweep is printed** so the matching recipe is visible.
 * Recommended Colab runtime: **A100 / H100 GPU**.
 """)
 
@@ -151,7 +159,10 @@ def load_image(path, preprocess):
 
 def make_tf(norm):
     ops = [T.ToPILImage(), T.Resize((img_size, img_size)), T.ToTensor()]   # ToTensor -> [0,1]
-    if norm == "imagenet": ops.append(T.Normalize(IMAGENET_MEAN, IMAGENET_STD))
+    if norm == "imagenet":
+        ops.append(T.Normalize(IMAGENET_MEAN, IMAGENET_STD))
+    elif norm == "gray":   # phd2 Swin used A.Normalize(mean=0.485, std=0.229) on all channels
+        ops.append(T.Normalize([0.485, 0.485, 0.485], [0.229, 0.229, 0.229]))
     return T.Compose(ops)
 
 class TestDataset(Dataset):
@@ -273,18 +284,24 @@ def init_tf():
               "| GPUs:", len(tf.config.list_physical_devices("GPU")))
     return _TF
 
-def build_keras_vgg16(tf):
+def build_keras_model(name, tf):
+    # mirrors the reference Keras training: base -> GAP -> Dense(256) -> Dropout -> softmax
     from tensorflow.keras import layers, models
-    base = tf.keras.applications.VGG16(weights=None, include_top=False, input_shape=(224, 224, 3))
+    if "resnet" in name.lower():
+        base = tf.keras.applications.ResNet101V2(weights=None, include_top=False, input_shape=(224, 224, 3))
+        drop = 0.25
+    else:  # vgg16
+        base = tf.keras.applications.VGG16(weights=None, include_top=False, input_shape=(224, 224, 3))
+        drop = 0.4
     inputs = layers.Input((224, 224, 3))
     x = base(inputs)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dense(256, activation="relu")(x)
-    x = layers.Dropout(0.4)(x)
+    x = layers.Dropout(drop)(x)
     out = layers.Dense(num_classes, activation="softmax")(x)
     return models.Model(inputs, out)
 
-def load_keras_model(path):
+def load_keras_model(path, name):
     tf = init_tf()
     try:
         m = tf.keras.models.load_model(path, compile=False)
@@ -292,12 +309,12 @@ def load_keras_model(path):
         return m
     except Exception as e:
         print("     load_model failed -> rebuild arch + load_weights:", str(e)[:90])
-        m = build_keras_vgg16(tf)
+        m = build_keras_model(name, tf)
         try:
             m.load_weights(path)
         except Exception:
             m.load_weights(path, by_name=True, skip_mismatch=True)
-        print("     loaded weights into rebuilt VGG16")
+        print(f"     loaded weights into rebuilt {name}")
         return m
 
 def keras_predict(model, preprocess):
@@ -316,7 +333,8 @@ md(r"""## 6 · Inference with auto input-matching
 For each model the notebook evaluates several input pipelines and keeps the best, printing the full
 sweep. **Read the sweep**: the winning row tells you how that checkpoint was actually preprocessed.""")
 
-co(r"""INPUT_CONFIGS = [(False, "imagenet"), (True, "imagenet"), (False, "scale"), (True, "scale")]
+co(r"""INPUT_CONFIGS = [(True, "gray"), (True, "imagenet"), (False, "gray"), (False, "imagenet"),
+                 (True, "scale"), (False, "scale")]
 
 @torch.no_grad()
 def torch_predict(model, loader, decode):
@@ -346,7 +364,7 @@ def sweep_torch(name, kind, weight):
     return best, rows
 
 def sweep_keras(name, weight):
-    model = load_keras_model(weight)
+    model = load_keras_model(weight, name)
     rows, best = [], None
     options = [False, True] if AUTO_MATCH else [FIXED_PREPROCESS]
     for pre in options:
@@ -367,9 +385,11 @@ for name, cfg in MODELS.items():
         print(f"\n=== {name}: skipped (INCLUDE_VGG16=False) ==="); continue
     if not WEIGHTS.get(name):
         print(f"\n=== {name}: skipped (no weight file) ==="); continue
-    print(f"\n=== {name} ({cfg['framework']}/{cfg['kind']}) ===")
+    # framework is decided by the actual file extension (.h5/.keras -> Keras, else PyTorch)
+    fw = "keras" if WEIGHTS[name].lower().endswith((".h5", ".keras", ".hdf5")) else "torch"
+    print(f"\n=== {name} ({fw}/{cfg['kind']}) ===")
     print("   weights:", os.path.basename(WEIGHTS[name]))
-    if cfg["framework"] == "torch":
+    if fw == "torch":
         best, rows = sweep_torch(name, cfg["kind"], WEIGHTS[name])
     else:
         best, rows = sweep_keras(name, WEIGHTS[name])
