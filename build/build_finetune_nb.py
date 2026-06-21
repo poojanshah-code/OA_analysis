@@ -17,14 +17,19 @@ Your models were trained on the **Mendeley Digital Knee X-ray** dataset and scor
 test split, but only ~30% on the **Kaggle KOA** dataset (`test2`). That gap is **domain shift** —
 same 5 KL classes, but different machines, contrast and grading style — not a bug.
 
-To make the models work on the Kaggle data they must **see it during training**. This notebook:
+To make the models work on the Kaggle data they must **see it during training**. This notebook
+supports **two modes** via `TRAIN_MODE`:
+
+* **`"finetune"`** — start from YOUR Mendeley checkpoints and adapt gently (≈30 epochs, low LR).
+* **`"scratch"`** — start from ImageNet and **train fully on the Kaggle data using your original
+  protocol** (≤200 epochs, early stopping patience 20, Adam 1e-4; the Keras nets freeze all but the
+  last 30 layers, exactly as in your reference notebooks). No Mendeley checkpoints needed.
+
+Either way it:
 1. **Splits** the single-folder `test2` (5 class folders) into stratified **train / val / test**.
-2. **Loads each pretrained checkpoint** as the starting point (best initialisation, not from scratch).
-3. **Fine-tunes** on the Kaggle train split (low LR, class-weighted, early stopping) in each model's
-   **native framework** (PyTorch for Swin/OA-HANet, Keras for ResNet101V2/VGG16 — auto-detected by
-   file extension).
-4. Reports **confusion matrix + classification report** per model on the Kaggle **test** split, and
-   a cross-model comparison.
+2. Trains each model in its **native framework** (PyTorch for Swin/OA-HANet, Keras `ResNet101V2`/`VGG16`).
+3. Reports **confusion matrix + classification report** per model on the Kaggle **test** split, and a
+   cross-model comparison.
 
 > Thesis story this supports: *trained on Dataset A → external validation on Dataset B shows a drop
 > → fine-tuning on B recovers performance* — a strong, reviewer-friendly narrative.
@@ -71,15 +76,24 @@ seed        = 42
 # split ratios (stratified): 70% train / 15% val / 15% test
 VAL_FRAC, TEST_FRAC = 0.15, 0.15
 
-# fine-tuning schedule
-TORCH_LR, KERAS_LR = 2e-5, 1e-5      # gentle LR so pretrained features are adapted, not destroyed
+# ---- Training mode ----
+#   "finetune": start from YOUR Mendeley checkpoints, adapt gently (few epochs, low LR).
+#   "scratch" : start from ImageNet, train fully on the Kaggle data with your ORIGINAL protocol
+#               (<=200 epochs, early stopping, Adam 1e-4; Keras nets freeze all but the last 30 layers).
+TRAIN_MODE = "finetune"          # "finetune" | "scratch"
 W_ORD, W_CLS, W_EARLY = 1.0, 0.5, 0.5
 
 QUICK_TEST = True
 if QUICK_TEST:
     EPOCHS, PATIENCE, SUBSET, BATCH = 3, 3, 600, 16
+elif TRAIN_MODE == "scratch":
+    EPOCHS, PATIENCE, SUBSET, BATCH = 200, 20, None, 16    # original protocol
 else:
-    EPOCHS, PATIENCE, SUBSET, BATCH = 30, 6, None, 16
+    EPOCHS, PATIENCE, SUBSET, BATCH = 30, 6, None, 16      # gentle fine-tune
+
+TORCH_LR = 1e-4 if TRAIN_MODE == "scratch" else 2e-5
+KERAS_LR = 1e-4 if TRAIN_MODE == "scratch" else 1e-5
+SUFFIX = "kaggle_scratch" if TRAIN_MODE == "scratch" else "finetuned"
 # ---------------------------------------------------
 for d in (RESULTS_DIR, SAVE_DIR): os.makedirs(d, exist_ok=True)
 random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -88,11 +102,18 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]; IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Which checkpoint trains in which framework / with which kind.
 MODELS = {
-    "OA-HANet":  dict(kind="oahanet",   torch_norm="imagenet"),
-    "Swin":      dict(kind="swin",      torch_norm="gray"),
-    "ResNet101": dict(kind="resnet101", torch_norm="imagenet"),
-    "VGG16":     dict(kind="vgg16",     torch_norm="imagenet"),
-}""")
+    "OA-HANet":  dict(kind="oahanet",   framework="torch", torch_norm="imagenet"),
+    "Swin":      dict(kind="swin",      framework="torch", torch_norm="gray"),
+    "ResNet101": dict(kind="resnet101", framework="keras", torch_norm="imagenet"),
+    "VGG16":     dict(kind="vgg16",     framework="keras", torch_norm="imagenet"),
+}
+
+def framework_of(name):
+    # finetune: detect from the checkpoint extension; scratch: use the model's native framework
+    w = WEIGHTS.get(name) if "WEIGHTS" in globals() else None
+    if TRAIN_MODE == "finetune" and w:
+        return "keras" if w.lower().endswith((".h5", ".keras", ".hdf5")) else "torch"
+    return MODELS[name]["framework"]""")
 
 md(r"""## 2 · Locate checkpoints & build the stratified split
 The single `test2` folder is split **once** into train/val/test; the **same split** is used by every
@@ -245,11 +266,11 @@ def ordinal_targets(y, K):
     lv = torch.arange(K - 1, device=y.device).unsqueeze(0); return (y.unsqueeze(1) > lv).float()
 def ordinal_decode(z): return (torch.sigmoid(z) > 0.5).sum(dim=1)
 
-def build_torch(kind):
-    if kind == "oahanet":   return OA_HANet(num_classes=num_classes, pretrained=False)
-    if kind == "swin":      return timm.create_model("swin_base_patch4_window7_224", pretrained=False, num_classes=num_classes)
-    if kind == "resnet101": return timm.create_model("resnet101", pretrained=False, num_classes=num_classes)
-    if kind == "vgg16":     return timm.create_model("vgg16", pretrained=False, num_classes=num_classes)
+def build_torch(kind, pretrained=False):
+    if kind == "oahanet":   return OA_HANet(num_classes=num_classes, pretrained=pretrained)
+    if kind == "swin":      return timm.create_model("swin_base_patch4_window7_224", pretrained=pretrained, num_classes=num_classes)
+    if kind == "resnet101": return timm.create_model("resnet101", pretrained=pretrained, num_classes=num_classes)
+    if kind == "vgg16":     return timm.create_model("vgg16", pretrained=pretrained, num_classes=num_classes)
 
 _IGN = ("relative_position_index", "attn_mask")
 def load_ckpt(model, path):
@@ -295,9 +316,14 @@ def step_torch(model, loader, kind, optimizer=None):
     return run / len(loader.dataset), accuracy_score(Tt, P), np.array(Tt), np.array(P)
 
 def finetune_torch(name, kind, weight, norm):
-    print(f"\n=== Fine-tune {name} ({kind}, torch, norm={norm}) ===")
+    tag = "Train(scratch)" if TRAIN_MODE == "scratch" else "Fine-tune"
+    print(f"\n=== {tag} {name} ({kind}, torch, norm={norm}) ===")
     tl, vl, el = torch_loaders(norm, preprocess=True)
-    model = load_ckpt(build_torch(kind), weight)
+    if TRAIN_MODE == "scratch":
+        model = build_torch(kind, pretrained=True).to(device)
+        print("     init: ImageNet-pretrained backbone (full training on Kaggle data)")
+    else:
+        model = load_ckpt(build_torch(kind, pretrained=False), weight)
     opt = torch.optim.AdamW(model.parameters(), lr=TORCH_LR, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
     best, wait, best_state, hist = math.inf, 0, None, {"tl": [], "ta": [], "vl": [], "va": []}
@@ -312,7 +338,7 @@ def finetune_torch(name, kind, weight, norm):
             wait += 1
             if wait >= PATIENCE: print(f"  early stop @ {ep}"); break
     if best_state: model.load_state_dict(best_state)
-    torch.save(model.state_dict(), os.path.join(SAVE_DIR, f"{name}_finetuned.pth"))
+    torch.save(model.state_dict(), os.path.join(SAVE_DIR, f"{name}_{SUFFIX}.pth"))
     _, acc, yt, yp = step_torch(model, el, kind)
     plot_curves(hist, name)
     print(f"  >>> {name} fine-tuned TEST accuracy: {acc*100:.2f}%")
@@ -345,12 +371,16 @@ def init_tf():
         print("TensorFlow", tf.__version__, "| GPUs:", len(tf.config.list_physical_devices("GPU")))
     return _TF
 
-def build_keras(name, tf):
+def build_keras(name, tf, weights=None):
+    # weights=None -> empty arch (for load_weights); weights="imagenet" -> scratch training init
     from tensorflow.keras import layers, models
     if "resnet" in name.lower():
-        base = tf.keras.applications.ResNet101V2(weights=None, include_top=False, input_shape=(224,224,3)); drop = 0.25
+        base = tf.keras.applications.ResNet101V2(weights=weights, include_top=False, input_shape=(224,224,3)); drop = 0.25
     else:
-        base = tf.keras.applications.VGG16(weights=None, include_top=False, input_shape=(224,224,3)); drop = 0.4
+        base = tf.keras.applications.VGG16(weights=weights, include_top=False, input_shape=(224,224,3)); drop = 0.4
+    if weights == "imagenet":   # original protocol: freeze all but the last 30 layers
+        base.trainable = True
+        for layer in base.layers[:-30]: layer.trainable = False
     inp = layers.Input((224,224,3)); x = base(inp); x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dense(256, activation="relu")(x); x = layers.Dropout(drop)(x)
     out = layers.Dense(num_classes, activation="softmax")(x)
@@ -371,7 +401,8 @@ def keras_df(split):
     return pd.DataFrame({"path": [p for p, _ in split], "label": [labels[t] for _, t in split]})
 
 def finetune_keras(name, weight):
-    print(f"\n=== Fine-tune {name} (keras) ===")
+    tag = "Train(scratch)" if TRAIN_MODE == "scratch" else "Fine-tune"
+    print(f"\n=== {tag} {name} (keras) ===")
     tf = init_tf()
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
     from tensorflow.keras.callbacks import EarlyStopping
@@ -384,14 +415,17 @@ def finetune_keras(name, weight):
     vg = plain.flow_from_dataframe(keras_df(val_s), batch_size=BATCH, shuffle=False, **common)
     eg = plain.flow_from_dataframe(keras_df(test_s), batch_size=BATCH, shuffle=False, **common)
 
-    model = load_keras(weight, name)
-    model.trainable = True
+    if TRAIN_MODE == "scratch":
+        model = build_keras(name, tf, weights="imagenet")   # ImageNet init, last-30 unfrozen
+        print("     init: ImageNet base, last 30 layers trainable (original protocol)")
+    else:
+        model = load_keras(weight, name); model.trainable = True
     model.compile(optimizer=tf.keras.optimizers.Adam(KERAS_LR),
                   loss="categorical_crossentropy", metrics=["accuracy"])
     es = EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True, verbose=1)
     hist = model.fit(tg, validation_data=vg, epochs=EPOCHS, class_weight=class_w_keras,
                      callbacks=[es], verbose=1)
-    model.save(os.path.join(SAVE_DIR, f"{name}_finetuned.h5"))
+    model.save(os.path.join(SAVE_DIR, f"{name}_{SUFFIX}.h5"))
 
     h = {"tl": hist.history["loss"], "ta": hist.history["accuracy"],
          "vl": hist.history["val_loss"], "va": hist.history["val_accuracy"]}
@@ -407,17 +441,20 @@ PyTorch models first, then Keras (so the GPU is free for TensorFlow). Framework 
 checkpoint's file extension.""")
 
 co(r"""preds = {}
-# --- PyTorch models (.pth) ---
+# --- PyTorch models ---
 for name, cfg in MODELS.items():
+    if framework_of(name) != "torch": continue
     w = WEIGHTS.get(name)
-    if not w: print(f"skip {name}: no checkpoint"); continue
-    if w.lower().endswith((".h5", ".keras", ".hdf5")): continue   # handled in keras pass
+    if TRAIN_MODE == "finetune" and not w:
+        print(f"skip {name}: no checkpoint for fine-tuning"); continue
     preds[name] = finetune_torch(name, cfg["kind"], w, cfg["torch_norm"])""")
 
-co(r"""# --- Keras models (.h5 / .keras) ---
+co(r"""# --- Keras models ---
 for name, cfg in MODELS.items():
+    if framework_of(name) != "keras": continue
     w = WEIGHTS.get(name)
-    if not w or not w.lower().endswith((".h5", ".keras", ".hdf5")): continue
+    if TRAIN_MODE == "finetune" and not w:
+        print(f"skip {name}: no checkpoint for fine-tuning"); continue
     preds[name] = finetune_keras(name, w)""")
 
 md(r"""## 8 · Per-model confusion matrix + classification report (Kaggle test split)""")
