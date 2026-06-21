@@ -26,12 +26,12 @@ and across all four models:
 * **Per-class recall heatmap** (models × KL grades)
 * A combined **metrics table** (CSV + PNG)
 
-> **Assumptions (edit in the config cell if needed):**
-> * Weight files are **PyTorch `.pth` state-dicts** saved from the unified PyTorch/`timm` pipeline
->   (Swin = `swin_base_patch4_window7_224`, ResNet-101 = `resnet101`, VGG-16 = `vgg16`,
->   OA-HANet = the class defined below).
-> * Images were trained **with contrast preprocessing**, so the same preprocessing is applied at
->   test time (toggle per-model with `preprocess` if a model was trained on raw images).
+> **Mixed frameworks (handled automatically):**
+> * **OA-HANet, Swin, ResNet-101** → PyTorch `.pth` state-dicts (loaded via `timm` / the OA-HANet class).
+> * **VGG-16** → Keras `.h5` (loaded via TensorFlow; TF runs with memory-growth so it shares the GPU
+>   with PyTorch). Set `INCLUDE_VGG16 = False` to skip it.
+> * Each model uses its own preprocessing/normalisation (ImageNet stats for PyTorch, `rescale 1./255`
+>   for Keras); the `preprocess` flag toggles the CLAHE+ROI-crop stage per model.
 > * Recommended Colab runtime: **A100 / H100 GPU**.
 """)
 
@@ -77,12 +77,14 @@ OAHANET_SWIN_NAME = "swin_base_patch4_window7_224"   # backbone used inside the 
 OAHANET_CNN_NAME  = "densenet121"
 
 # Per-model settings. 'preprocess' must match how each model was TRAINED.
+# framework: "torch" (.pth state-dict via timm) or "keras" (.h5/.keras Sequential/Functional model).
 MODELS = {
-    "OA-HANet":  dict(kind="oahanet",   preprocess=True),
-    "Swin":      dict(kind="swin",      preprocess=True),
-    "ResNet101": dict(kind="resnet101", preprocess=True),
-    "VGG16":     dict(kind="vgg16",     preprocess=True),
+    "OA-HANet":  dict(kind="oahanet",   framework="torch", preprocess=True),
+    "Swin":      dict(kind="swin",      framework="torch", preprocess=True),
+    "ResNet101": dict(kind="resnet101", framework="torch", preprocess=True),
+    "VGG16":     dict(kind="vgg16",     framework="keras", preprocess=True),
 }
+INCLUDE_VGG16 = True        # set False to skip the Keras VGG16 entirely
 # ---------------------------------------------------
 os.makedirs(RESULTS_DIR, exist_ok=True)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]; IMAGENET_STD = [0.229, 0.224, 0.225]""")
@@ -92,7 +94,7 @@ The notebook scans `WEIGHTS_DIR` and auto-maps each model by keyword. **Check th
 — if any file is mis-matched, edit the `WEIGHTS` dict in the next cell with the exact filename.""")
 
 co(r"""weight_files = []
-for ext in ("*.pth", "*.pt", "*.bin"):
+for ext in ("*.pth", "*.pt", "*.bin", "*.h5", "*.keras", "*.hdf5"):
     weight_files += glob.glob(os.path.join(WEIGHTS_DIR, ext))
 print("Files found in", WEIGHTS_DIR, ":")
 for f in weight_files: print("   ", os.path.basename(f))
@@ -125,9 +127,16 @@ co(r"""# --- If auto-detection is wrong, hard-code the exact filenames here, e.g
 # WEIGHTS["OA-HANet"]  = os.path.join(WEIGHTS_DIR, "oahanet_full.pth")
 # WEIGHTS["ResNet101"] = os.path.join(WEIGHTS_DIR, "resnet101_best.pth")
 # WEIGHTS["VGG16"]     = os.path.join(WEIGHTS_DIR, "vgg16_best.pth")
-for m, f in WEIGHTS.items():
-    assert f and os.path.exists(f), f"Missing weight file for {m} — set WEIGHTS['{m}'] manually."
-print("All 4 weight files resolved.")""")
+for m, cfg in MODELS.items():
+    if m == "VGG16" and not INCLUDE_VGG16:
+        continue
+    f = WEIGHTS.get(m)
+    if not (f and os.path.exists(f)):
+        if m == "VGG16":
+            print(f"WARNING: VGG16 weight not found — it will be skipped.")
+        else:
+            raise AssertionError(f"Missing weight file for {m} — set WEIGHTS['{m}'] manually.")
+print("Weight files resolved.")""")
 
 md(r"""## 3 · Preprocessing, dataset and loaders
 Identical preprocessing to training (grayscale → CLAHE → robust ROI crop). A separate loader is
@@ -267,7 +276,66 @@ def load_weights(model, path):
     if nunexp: print("       e.g. unexpected:", res.unexpected_keys[:3])
     return model.to(device).eval()""")
 
-md(r"""## 6 · Run inference for all 4 models""")
+md(r"""## 5b · Keras (TensorFlow) support for the VGG-16 `.h5`
+VGG-16 was trained in Keras, so it is loaded with TensorFlow and run with its original
+preprocessing (`rescale 1./255`, 3-channel). TF is configured for **memory growth** so it coexists
+with PyTorch on the same GPU. If the `.h5` is weights-only, the original architecture is rebuilt and
+the weights are loaded into it.""")
+
+co(r"""_TF = None
+def init_tf():
+    global _TF
+    if _TF is None:
+        import tensorflow as tf
+        for gpu in tf.config.list_physical_devices("GPU"):
+            try: tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception: pass
+        _TF = tf
+        print("TensorFlow", tf.__version__, "| GPUs:", len(tf.config.list_physical_devices("GPU")))
+    return _TF
+
+def build_keras_vgg16(tf):
+    # mirrors the reference training architecture (VGG16 base -> GAP -> Dense(256) -> Dropout -> softmax)
+    from tensorflow.keras import layers, models
+    base = tf.keras.applications.VGG16(weights=None, include_top=False, input_shape=(224, 224, 3))
+    inputs = layers.Input((224, 224, 3))
+    x = base(inputs)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.4)(x)
+    out = layers.Dense(num_classes, activation="softmax")(x)
+    return models.Model(inputs, out)
+
+def load_keras_model(path):
+    tf = init_tf()
+    try:
+        m = tf.keras.models.load_model(path, compile=False)
+        print("     loaded full Keras model")
+        return m
+    except Exception as e:
+        print("     full load_model failed -> rebuilding arch + load_weights:", str(e)[:100])
+        m = build_keras_vgg16(tf)
+        m.load_weights(path)
+        print("     loaded weights into rebuilt VGG16")
+        return m
+
+def infer_keras(model, preprocess):
+    # Keras pipeline: 3-channel image scaled to [0,1] (no ImageNet normalisation)
+    ds = TestDataset(TEST_DIR, preprocess)
+    P, Tt, buf_x, buf_t = [], [], [], []
+    for path, t in tqdm(ds.samples, leave=False):
+        arr = load_image(path, preprocess).astype("float32") / 255.0
+        arr = cv2.resize(arr, (img_size, img_size))
+        buf_x.append(arr); buf_t.append(t)
+        if len(buf_x) == batch_size:
+            pr = model.predict(np.asarray(buf_x), verbose=0)
+            P.extend(pr.argmax(1).tolist()); Tt.extend(buf_t); buf_x, buf_t = [], []
+    if buf_x:
+        pr = model.predict(np.asarray(buf_x), verbose=0)
+        P.extend(pr.argmax(1).tolist()); Tt.extend(buf_t)
+    return np.array(P), np.array(Tt)""")
+
+md(r"""## 6 · Run inference for all models""")
 
 co(r"""@torch.no_grad()
 def infer(model, loader, kind):
@@ -280,14 +348,21 @@ def infer(model, loader, kind):
 
 preds = {}
 for name, cfg in MODELS.items():
-    print(f"\n=== {name} ({cfg['kind']}, preprocess={cfg['preprocess']}) ===")
+    if name == "VGG16" and not INCLUDE_VGG16:
+        print(f"\n=== {name}: skipped (INCLUDE_VGG16=False) ==="); continue
+    if not WEIGHTS.get(name):
+        print(f"\n=== {name}: skipped (no weight file) ==="); continue
+    print(f"\n=== {name} ({cfg['framework']}/{cfg['kind']}, preprocess={cfg['preprocess']}) ===")
     print("   weights:", os.path.basename(WEIGHTS[name]))
-    model = build_model(cfg["kind"])
-    model = load_weights(model, WEIGHTS[name])
-    y_pred, y_true = infer(model, get_loader(cfg["preprocess"]), cfg["kind"])
+    if cfg["framework"] == "torch":
+        model = load_weights(build_model(cfg["kind"]), WEIGHTS[name])
+        y_pred, y_true = infer(model, get_loader(cfg["preprocess"]), cfg["kind"])
+        del model; torch.cuda.empty_cache()
+    else:  # keras
+        kmodel = load_keras_model(WEIGHTS[name])
+        y_pred, y_true = infer_keras(kmodel, cfg["preprocess"])
     preds[name] = (y_true, y_pred)
-    print(f"   Test accuracy: {accuracy_score(y_true, y_pred)*100:.2f}%")
-    del model; torch.cuda.empty_cache()""")
+    print(f"   Test accuracy: {accuracy_score(y_true, y_pred)*100:.2f}%")""")
 
 md(r"""## 7 · Per-model confusion matrix + classification report""")
 
@@ -337,9 +412,10 @@ plt.show()""")
 md(r"""## 9 · Comparison bar charts (across models & across metrics)""")
 
 co(r"""# (a) Accuracy across models
+model_names = list(preds.keys())
 plt.figure(figsize=(7.5, 4.5))
-accs = [model_metrics(*preds[n])["Accuracy"] for n in MODELS]
-bars = plt.bar(list(MODELS.keys()), accs, color=["#31a354", "#08519c", "#3182bd", "#9ecae1"])
+accs = [model_metrics(*preds[n])["Accuracy"] for n in model_names]
+bars = plt.bar(model_names, accs, color=["#31a354", "#08519c", "#3182bd", "#9ecae1"][:len(model_names)])
 for b, a in zip(bars, accs):
     plt.text(b.get_x() + b.get_width()/2, a + 0.3, f"{a:.2f}", ha="center", fontweight="bold")
 plt.ylabel("Test Accuracy (%)"); plt.title("Overall Accuracy across Models")
@@ -347,7 +423,7 @@ plt.ylim(min(accs) - 5, min(100, max(accs) + 5))
 plt.tight_layout(); plt.savefig(os.path.join(RESULTS_DIR, "compare_accuracy_bar.png"), dpi=160, bbox_inches="tight"); plt.show()
 
 # (b) Grouped bar: all metrics across all models
-names = list(MODELS.keys()); x = np.arange(len(metric_cols)); w = 0.8 / len(names)
+names = list(preds.keys()); x = np.arange(len(metric_cols)); w = 0.8 / len(names)
 plt.figure(figsize=(12, 5))
 palette = ["#31a354", "#08519c", "#3182bd", "#9ecae1"]
 for i, n in enumerate(names):
@@ -362,11 +438,11 @@ Highlights each model's behaviour on the hard early grades (G0/G1).""")
 
 co(r"""rec_mat = np.array([
     recall_score(preds[n][0], preds[n][1], average=None, labels=np.arange(num_classes), zero_division=0) * 100
-    for n in MODELS
+    for n in preds
 ])
 plt.figure(figsize=(8, 4.5))
 sns.heatmap(rec_mat, annot=True, fmt=".1f", cmap="YlGnBu",
-            xticklabels=labels, yticklabels=list(MODELS.keys()), vmin=0, vmax=100)
+            xticklabels=labels, yticklabels=list(preds.keys()), vmin=0, vmax=100)
 plt.title("Per-class Recall (%) — Models × KL Grades"); plt.xlabel("KL grade"); plt.ylabel("Model")
 plt.tight_layout(); plt.savefig(os.path.join(RESULTS_DIR, "compare_per_class_recall_heatmap.png"), dpi=160, bbox_inches="tight"); plt.show()
 
