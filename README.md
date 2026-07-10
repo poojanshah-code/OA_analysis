@@ -103,11 +103,13 @@ one identical PyTorch/`timm` protocol, no ablation study:
   (grade-distance loss) and an **early-grade discrimination head** (Normal-vs-Doubtful
   contrastive sub-head), trained jointly with the main 5-class head.
 
-**2-phase fine-tuning protocol** (all 6 models): a short head/fusion-only warm-up with the backbone
-fully frozen, then the **entire backbone unfrozen** with differential LR (small on the pretrained
-trunk, larger on the new head/fusion), a linear-warmup + cosine-decay schedule, and gradient
-clipping — this replaced an earlier "unfreeze only the last 20 layers + `ReduceLROnPlateau`" recipe
-that underfit every model (train accuracy plateaued in the 55-67% range). The Otsu/morphology
+**2-phase fine-tuning protocol** (all 6 models, `UNFREEZE_LAST=20`): a short head/fusion-only
+warm-up with the backbone fully frozen, then the **last 20 backbone layers unfrozen** with
+differential LR (small on the pretrained trunk, larger on the new head/fusion), a linear-warmup +
+cosine-decay schedule, and gradient clipping. The original single-phase "unfreeze last 20 layers +
+`ReduceLROnPlateau`" recipe underfit every model (train accuracy plateaued in the 55-67% range) —
+the 2-phase warm-up + cosine schedule + gradient clipping fix that at the same fine-tuning depth
+(set `FULL_FINETUNE=True` in §2 to unfreeze the entire backbone instead). The Otsu/morphology
 preprocessing crop also now falls back to the full CLAHE frame when the detected bounding box is
 implausibly small or large, instead of risking a crop that cuts off the joint.
 

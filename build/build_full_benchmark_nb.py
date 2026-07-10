@@ -133,22 +133,25 @@ USE_CLASS_WEIGHTS = True    # inverse-frequency weighting in the loss
 SAVE_WEIGHTS  = True        # save each model's best weights (needed for Grad-CAM)
 STAGE_TO_LOCAL = True       # copy dataset from Google Drive to fast local disk
 
-# ---- Fine-tuning protocol (2-phase: head warm-up, then full backbone fine-tune) ----
-# The first pass (UNFREEZE_LAST=20, single-phase, plateau LR schedule) badly underfit every
-# model (train acc plateaued <=67%, val acc tracked train acc closely with a noisy val curve,
-# not classic overfitting) -- the backbone simply wasn't given enough capacity/LR to adapt from
-# ImageNet to knee radiographs. Fix: warm up the new head/fusion for a few epochs with the
-# backbone fully frozen (stabilises the randomly-initialised head before any backbone gradients
-# flow), then fully unfreeze the backbone (differential LR: small on the pretrained trunk, larger
-# on the head/fusion) with a cosine LR schedule (+ short linear warmup) instead of ReduceLROnPlateau,
-# which was halving LR every 5 stagnant epochs and starving fine-tuning before it could progress.
+# ---- Fine-tuning protocol (2-phase: head warm-up, then unfreeze the last N backbone layers) ----
+# The very first pass (UNFREEZE_LAST=20, single-phase, plateau LR schedule) badly underfit every
+# model (train acc plateaued <=67%, val acc tracked train acc closely with a noisy val curve, not
+# classic overfitting). That single-phase recipe had two problems at once: (1) the fresh head and
+# the pretrained trunk started adapting simultaneously from epoch 1, and (2) ReduceLROnPlateau
+# halved the LR every 5 stagnant epochs, starving fine-tuning before the unfrozen layers could
+# adapt. This run keeps the requested last-20-layers unfreeze depth but fixes those two issues:
+# a short head-only warm-up (backbone fully frozen) before any backbone gradients flow, then
+# unfreeze the last UNFREEZE_LAST layers with differential LR (small on the pretrained trunk,
+# larger on the head/fusion), a linear-warmup + cosine-decay schedule (instead of plateau-halving),
+# and global-norm gradient clipping for stability.
 WARMUP_EPOCHS  = 5           # phase A: head/fusion-only, backbone fully frozen
-FULL_FINETUNE  = True        # phase B: unfreeze the ENTIRE backbone (not just the last N layers)
-UNFREEZE_LAST  = 60          # only used if FULL_FINETUNE=False (partial unfreeze depth)
-LR             = 3e-5        # phase-B backbone LR (low: avoids catastrophic forgetting when fully unfrozen)
+FULL_FINETUNE  = False       # phase B: unfreeze only the last UNFREEZE_LAST backbone layers
+UNFREEZE_LAST  = 20          # fine-tuning depth for every model (unified benchmark protocol)
+LR             = 5e-5        # phase-B backbone LR (only the last 20 layers train, so a bit higher
+                              # than the full-fine-tune LR is safe -- less catastrophic-forgetting risk)
 HEAD_LR_MULT   = 15.0        # new head/fusion trains at LR*this (phase A also uses this LR)
 WEIGHT_DECAY   = 1e-5
-GRAD_CLIP      = 1.0         # global-norm gradient clipping (stabilises full fine-tuning)
+GRAD_CLIP      = 1.0         # global-norm gradient clipping (stabilises fine-tuning)
 LR_WARMUP_EPOCHS = 3         # short linear LR warmup at the *start of phase B* before cosine decay
 
 # ---- OA-HANet specific ----
@@ -665,10 +668,12 @@ for m in MODEL_NAMES:
 md(r"""## §7 · Layer-wise fine-tuning control
 
 `set_finetune(model, n_last)` freezes the whole backbone, then unfreezes only its last `n_last`
-parameterised leaf layers (`n_last=0` freezes the entire backbone; `n_last>=` the total leaf count
-unfreezes it entirely — used for phase-B **full fine-tuning** in §8). The custom head / fusion /
-auxiliary-head modules are always trainable. Applied identically to all 6 models for a fair
-benchmark.""")
+parameterised leaf layers (`n_last=0` freezes the entire backbone — used for phase A's head-only
+warm-up; `n_last>=` the total leaf count would unfreeze it entirely, for an optional full
+fine-tune). §2 sets `UNFREEZE_LAST=20` and `FULL_FINETUNE=False`, so phase B (§8) unfreezes just
+the **last 20** parameterised leaf layers of every backbone — the same fine-tuning depth for all 6
+models (unified benchmark protocol). The custom head / fusion / auxiliary-head modules are always
+trainable regardless of `n_last`.""")
 
 co(r"""def _backbone_leaf_modules(model):
     bbs = []
@@ -737,12 +742,13 @@ md(r"""## §8 · Training / evaluation engine (2-phase fine-tuning, early stoppi
   the new head/fusion/auxiliary-head modules train, at `LR*HEAD_LR_MULT`. This lets the randomly
   initialised head reach a reasonable starting point before any gradient reaches the pretrained
   weights, instead of the two fighting each other from epoch 1.
-* **Phase B (fine-tune, remaining epochs)** — the **entire backbone** is unfrozen
-  (`FULL_FINETUNE=True`) with differential LR (small `LR` on the pretrained trunk, `LR*HEAD_LR_MULT`
-  on the head/fusion) and a **short linear LR warmup + cosine decay** schedule (replacing
-  `ReduceLROnPlateau`, which was halving LR every 5 stagnant epochs and starving fine-tuning before
-  the newly-unfrozen backbone could adapt). Global-norm **gradient clipping** (`GRAD_CLIP`)
-  stabilises the larger effective learning signal from a fully-unfrozen backbone.
+* **Phase B (fine-tune, remaining epochs)** — the **last `UNFREEZE_LAST` (=20) backbone layers**
+  are unfrozen (set `FULL_FINETUNE=True` in §2 to unfreeze the entire backbone instead) with
+  differential LR (small `LR` on the pretrained trunk, `LR*HEAD_LR_MULT` on the head/fusion) and a
+  **short linear LR warmup + cosine decay** schedule (replacing `ReduceLROnPlateau`, which was
+  halving LR every 5 stagnant epochs and starving fine-tuning before the newly-unfrozen layers
+  could adapt). Global-norm **gradient clipping** (`GRAD_CLIP`) stabilises training once the
+  backbone starts receiving gradients.
 
 Both the 5 single-head models (`run_epoch` + `CrossEntropyLoss`) and OA-HANet's multi-head training
 (`hybrid_multitask_loss`) go through the same 2-phase / early-stopping / checkpoint pipeline.""")
