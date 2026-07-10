@@ -30,18 +30,21 @@ which ships as two pre-resized variants of the same radiographs under one `oad` 
 
 ```
 /content/drive/MyDrive/oad/
-├── kneeKL224/                     # feeds every 224x224 backbone
+├── kneeKL224/
 │   ├── train/  0/ 1/ 2/ 3/ 4/
 │   ├── val/    0/ 1/ 2/ 3/ 4/
 │   └── test/   0/ 1/ 2/ 3/ 4/
-└── kneeKL299/                     # feeds InceptionV3 (native 299x299 input)
+└── kneeKL299/
     ├── train/  0/ 1/ 2/ 3/ 4/
     ├── val/    0/ 1/ 2/ 3/ 4/
     └── test/   0/ 1/ 2/ 3/ 4/
 ```
 
-Class folders `0..4` are the KL grades (0 Normal … 4 Severe); `kneeKL224` and `kneeKL299` contain
-the same images, so their per-split/per-class counts must match (checked in §3 of the notebook).
+Class folders `0..4` are the KL grades (0 Normal … 4 Severe). **Both folders are combined**: for
+every split the notebook pools the file lists from `kneeKL224/<split>/<class>` and
+`kneeKL299/<split>/<class>`, so all 6 models are trained, validated and tested on the union of both
+resolutions (each image is resized on load to the model's native input size — 224 or 299 — no
+matter which folder it came from). §3 reports counts for each folder individually and combined.
 
 ---
 
@@ -90,20 +93,21 @@ Produces the same suite of artefacts plus a per-class recall plot (highlighting 
 comparison table against the Swin baseline.
 
 ### `notebooks/05_full_benchmark_6models_OAHANet.ipynb`
-Benchmark of **6 architectures** on the `oad/kneeKL224` + `oad/kneeKL299` dataset (see Dataset
-section above), under one identical PyTorch/`timm` protocol, no ablation study:
+Benchmark of **6 architectures** on the **combined** `oad/kneeKL224` + `oad/kneeKL299` dataset (see
+Dataset section above — every model trains/validates/tests on the union of both folders), under
+one identical PyTorch/`timm` protocol, no ablation study:
 
-* **ResNet50**, **InceptionV3** (299×299), **MobileNetV1**, **ViT-Base**, **Swin Transformer**
+* **ResNet50**, **InceptionV3** (299×299 native input), **MobileNetV1**, **ViT-Base**, **Swin Transformer**
 * **OA-HANet (proposed)** — Swin backbone (global) + multi-scale DenseNet-121 reuse branch (local,
   read at 3 dense-block stages) fused by cross-attention, plus an **ordinal-aware head**
   (grade-distance loss) and an **early-grade discrimination head** (Normal-vs-Doubtful
   contrastive sub-head), trained jointly with the main 5-class head.
 
-Produces: dataset composition table (total + classwise train/val/test counts), CLAHE→Otsu
-preprocessing sanity check, train/val accuracy & loss table, learning curves, confusion matrices,
-classwise precision/recall/F1 table + heatmap, misclassification analysis (top confusion pairs +
-misclassified-sample gallery), confidence-score sample collages, Grad-CAM explainability
-collages, and a master results summary — for all 6 models.
+Produces: dataset composition tables (per-folder AND combined train/val/test totals + classwise
+counts), CLAHE→Otsu preprocessing sanity check, train/val accuracy & loss table, learning curves,
+confusion matrices, classwise precision/recall/F1 table + heatmap, misclassification analysis (top
+confusion pairs + misclassified-sample gallery), confidence-score sample collages, Grad-CAM
+explainability collages, and a master results summary — for all 6 models.
 
 ---
 

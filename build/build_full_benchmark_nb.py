@@ -29,11 +29,17 @@ Osteoarthritis Severity Grading, Mendeley), which ships as two pre-resized varia
 ```
 
 Classes `0..4` are the KL grades **0 Normal, 1 Doubtful, 2 Mild, 3 Moderate, 4 Severe**.
-`kneeKL224` feeds every 224×224 backbone; `kneeKL299` feeds InceptionV3 (native 299×299 input).
+
+**Both dataset folders are combined for every model.** For each split (train/val/test) the file
+lists from `kneeKL224/<split>/<class>` and `kneeKL299/<split>/<class>` are pooled into one dataset,
+so every one of the 6 models is trained, validated and tested on the **union of both resolutions**
+(each sample is resized on-the-fly to the model's native input size — 224 or 299 — regardless of
+which folder it came from). This effectively doubles the number of training/validation/test
+examples versus using a single variant.
 
 **Models (6):**
 
-| # | Model | Input | Notes |
+| # | Model | Native input | Notes |
 |---|-------|:-----:|-------|
 | a | **ResNet50** | 224 | timm `resnet50`, ImageNet-pretrained |
 | b | **InceptionV3** | 299 | timm `inception_v3` |
@@ -46,8 +52,8 @@ Classes `0..4` are the KL grades **0 Normal, 1 Doubtful, 2 Mild, 3 Moderate, 4 S
 
 | Deliverable | Section |
 |-------------|---------|
-| Dataset preparation for the new `oad/kneeKL224` + `oad/kneeKL299` layout | §2–§3 |
-| Total train/val/test image counts + classwise counts (printed + table) | §3 |
+| Dataset preparation combining `oad/kneeKL224` + `oad/kneeKL299` | §2–§3 |
+| Per-folder AND combined train/val/test image counts + classwise counts (printed + table) | §3 |
 | Shared CLAHE→Otsu→morphology preprocessing (same as reference pipeline) | §4 |
 | Train Acc / Train Loss / Val Acc / Val Loss table — all 6 models | §9 |
 | Learning curves (accuracy & loss) — all 6 models | §10 |
@@ -212,9 +218,10 @@ print("Active variant roots:", VARIANT_DIRS)""")
 # ============================================================================
 md(r"""## §3 · Dataset preparation — image counts (train/val/test, classwise)
 
-Both `kneeKL224` and `kneeKL299` contain the **same radiographs** at two resolutions, so their
-counts must match; we compute and display both as a sanity check, then use the counts to build the
-per-class composition table used throughout the paper.""")
+Every model in §9 is trained/validated/tested on the **union of `kneeKL224` and `kneeKL299`**
+(§5 pools both folders per split). This section reports counts three ways: (1) `kneeKL224` alone,
+(2) `kneeKL299` alone, (3) the **combined** totals that are actually used for training — each as a
+classwise composition table, plus the combined grand totals per split.""")
 
 co(r"""def count_split_class(variant_root):
     # returns {split: {class: n}} for one dataset variant root
@@ -223,33 +230,38 @@ co(r"""def count_split_class(variant_root):
         out[split] = {c: len(glob.glob(os.path.join(variant_root, split, c, "*"))) for c in labels}
     return out
 
+def composition_table(counts, title_tag):
+    rows = []
+    for i, c in enumerate(labels):
+        tr_n, va_n, te_n = counts["train"][c], counts["val"][c], counts["test"][c]
+        rows.append([f"{c} ({class_short[i]})", tr_n, va_n, te_n, tr_n + va_n + te_n])
+    df = pd.DataFrame(rows, columns=["KL Grade", "Train", "Val", "Test", "Total"])
+    df.loc["Grand Total"] = ["—"] + [df[col].sum() for col in ["Train", "Val", "Test", "Total"]]
+    df.to_csv(os.path.join(RESULTS_DIR, f"table_dataset_composition_{title_tag}.csv"), index=False)
+    return df
+
 variant_counts = {sz: count_split_class(root) for sz, root in VARIANT_DIRS.items()}
 
-# ---- sanity check: kneeKL224 and kneeKL299 must describe the same dataset ----
-sizes = list(variant_counts.keys())
-if len(sizes) == 2:
-    a, b = variant_counts[sizes[0]], variant_counts[sizes[1]]
-    mismatch = any(a[s][c] != b[s][c] for s in a for c in labels)
-    print(f"kneeKL{sizes[0]} vs kneeKL{sizes[1]} image counts match:", not mismatch)
+# ---- combined counts: union of both folders per split/class (what every model actually sees) ----
+combined_counts = {split: {c: sum(variant_counts[sz][split][c] for sz in VARIANT_DIRS)
+                           for c in labels} for split in ("train", "val", "test")}
 
-# ---- total images per split ----
-print("\n=== Total images per split (kneeKL224) ===")
-ref_counts = variant_counts[224] if 224 in variant_counts else variant_counts[sizes[0]]
-split_totals = {s: sum(ref_counts[s].values()) for s in ("train", "val", "test")}
-for s, n in split_totals.items():
+tables_by_variant = {sz: composition_table(variant_counts[sz], f"kneeKL{sz}") for sz in VARIANT_DIRS}
+combined_table = composition_table(combined_counts, "combined")
+
+for sz, df in tables_by_variant.items():
+    print(f"\n=== kneeKL{sz} — classwise image composition ===")
+    print(df.to_string(index=False))
+
+print("\n=== COMBINED (kneeKL224 + kneeKL299) — classwise image composition ===")
+print(combined_table.to_string(index=False))
+
+# ---- combined totals per split (train count / val count / test count) ----
+combined_split_totals = {s: sum(combined_counts[s].values()) for s in ("train", "val", "test")}
+print("\n=== Combined total images per split (used for training) ===")
+for s, n in combined_split_totals.items():
     print(f"  {s:5s}: {n}")
-print(f"  TOTAL : {sum(split_totals.values())}")
-
-# ---- classwise composition table (rows = KL grade, cols = Train/Val/Test/Total) ----
-rows = []
-for i, c in enumerate(labels):
-    tr_n, va_n, te_n = ref_counts["train"][c], ref_counts["val"][c], ref_counts["test"][c]
-    rows.append([f"{c} ({class_short[i]})", tr_n, va_n, te_n, tr_n + va_n + te_n])
-class_table = pd.DataFrame(rows, columns=["KL Grade", "Train", "Val", "Test", "Total"])
-class_table.loc["Grand Total"] = ["—"] + [class_table[col].sum() for col in ["Train", "Val", "Test", "Total"]]
-class_table.to_csv(os.path.join(RESULTS_DIR, "table_dataset_composition.csv"), index=False)
-print("\n=== Classwise image composition ===")
-print(class_table.to_string(index=False))""")
+print(f"  TOTAL : {sum(combined_split_totals.values())}")""")
 
 co(r"""def render_df_table(df, title, fname, fontsize=9, left_cols=(), shorten_cols=()):
     # renders a DataFrame as a clean matplotlib table with content-proportional column
@@ -278,11 +290,16 @@ co(r"""def render_df_table(df, title, fname, fontsize=9, left_cols=(), shorten_c
     plt.tight_layout()
     plt.savefig(os.path.join(FIG_DIR, fname), dpi=170, bbox_inches="tight"); plt.show()
 
-render_df_table(class_table, "Dataset composition — images per KL grade × split",
-                "table_dataset_composition.png", left_cols=("KL Grade",))
+for sz, df in tables_by_variant.items():
+    render_df_table(df, f"Dataset composition — kneeKL{sz} — images per KL grade × split",
+                    f"table_dataset_composition_kneeKL{sz}.png", left_cols=("KL Grade",))
 
-# ---- classwise distribution bar chart ----
-plot_df = class_table.iloc[:-1]
+render_df_table(combined_table, "Dataset composition — COMBINED (kneeKL224 + kneeKL299) — "
+                "images per KL grade × split (used for training)",
+                "table_dataset_composition_combined.png", left_cols=("KL Grade",))
+
+# ---- classwise distribution bar chart (combined data actually used for training) ----
+plot_df = combined_table.iloc[:-1]
 x = np.arange(len(plot_df)); w = 0.27
 fig, ax = plt.subplots(figsize=(9, 5))
 ax.bar(x-w, plot_df["Train"], w, label="Train", color="#08519c")
@@ -290,8 +307,8 @@ ax.bar(x,   plot_df["Val"],   w, label="Val",   color="#41ab5d")
 ax.bar(x+w, plot_df["Test"],  w, label="Test",  color="#fd8d3c")
 ax.set_xticks(x); ax.set_xticklabels(plot_df["KL Grade"], rotation=20, ha="right")
 ax.set_ylabel("Image count"); ax.legend(); ax.grid(axis="y", alpha=0.3)
-ax.set_title("Class distribution across train/val/test splits")
-plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "bar_dataset_composition.png"), dpi=160,
+ax.set_title("Combined (kneeKL224 + kneeKL299) class distribution across train/val/test splits")
+plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "bar_dataset_composition_combined.png"), dpi=160,
                                 bbox_inches="tight"); plt.show()""")
 
 # ============================================================================
@@ -385,10 +402,13 @@ plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "preprocessing_sanity_chec
                                 bbox_inches="tight"); plt.show()""")
 
 # ============================================================================
-md(r"""## §5 · Datasets, transforms & loaders (per model input size)
+md(r"""## §5 · Datasets, transforms & loaders (both dataset folders pooled)
 
-Loaders are built per `(variant, img_size)` pair and cached, so `kneeKL224` loaders are shared by
-5 of the 6 models and `kneeKL299` loaders are built once for InceptionV3.""")
+`KneeDataset` now takes **all variant roots** (`kneeKL224` *and* `kneeKL299`) and, for a given
+split, concatenates the file lists from every root — so the effective train/val/test sets are the
+**union** of both folders (matching the combined counts printed in §3). Every image is resized to
+the target model's native `img_size` (224 or 299) at load time regardless of which folder it came
+from, so this works uniformly for all 6 models. Loaders are cached per `img_size`.""")
 
 co(r"""def build_transforms(img_size):
     train_tf = T.Compose([
@@ -402,13 +422,14 @@ co(r"""def build_transforms(img_size):
     return train_tf, eval_tf
 
 class KneeDataset(Dataset):
-    def __init__(self, root_dir, classes, img_size, preprocess, transforms, subset=None):
+    def __init__(self, variant_roots, split, classes, img_size, preprocess, transforms, subset=None):
         self.img_size, self.preprocess, self.transforms = img_size, preprocess, transforms
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         self.samples = []
-        for c in classes:
-            for f in sorted(glob.glob(os.path.join(root_dir, c, "*"))):
-                self.samples.append((f, self.class_to_idx[c]))
+        for root in variant_roots:                         # pool kneeKL224 + kneeKL299
+            for c in classes:
+                for f in sorted(glob.glob(os.path.join(root, split, c, "*"))):
+                    self.samples.append((f, self.class_to_idx[c]))
         if subset:
             random.Random(SEED).shuffle(self.samples)
             self.samples = self.samples[:subset]
@@ -424,11 +445,12 @@ class KneeDataset(Dataset):
         path, y = self.samples[i]
         return self.transforms(load_image(path, self.img_size, self.preprocess)), y, path
 
-def make_loaders(variant_root, img_size, preprocess=True, subset=SUBSET):
+def make_loaders(img_size, preprocess=True, subset=SUBSET):
+    variant_roots = list(VARIANT_DIRS.values())            # kneeKL224 + kneeKL299 combined
     train_tf, eval_tf = build_transforms(img_size)
-    tr = KneeDataset(os.path.join(variant_root, "train"), labels, img_size, preprocess, train_tf, subset)
-    va = KneeDataset(os.path.join(variant_root, "val"),   labels, img_size, preprocess, eval_tf,  subset)
-    te = KneeDataset(os.path.join(variant_root, "test"),  labels, img_size, preprocess, eval_tf,  None)
+    tr = KneeDataset(variant_roots, "train", labels, img_size, preprocess, train_tf, subset)
+    va = KneeDataset(variant_roots, "val",   labels, img_size, preprocess, eval_tf,  subset)
+    te = KneeDataset(variant_roots, "test",  labels, img_size, preprocess, eval_tf,  None)
     nw = 2
     return (tr, va, te,
             DataLoader(tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=nw, pin_memory=True),
@@ -441,12 +463,16 @@ def compute_weights(train_ds):
     return torch.tensor(w, dtype=torch.float, device=device)
 
 _LOADER_CACHE = {}
-def get_loaders(variant_size):
-    if variant_size not in _LOADER_CACHE:
-        _LOADER_CACHE[variant_size] = make_loaders(VARIANT_DIRS[variant_size], variant_size)
-    return _LOADER_CACHE[variant_size]
+def get_loaders(img_size):
+    if img_size not in _LOADER_CACHE:
+        _LOADER_CACHE[img_size] = make_loaders(img_size)
+        tr = _LOADER_CACHE[img_size][0]
+        print(f"img_size={img_size}: pooled train={len(tr)} "
+              f"val={len(_LOADER_CACHE[img_size][1])} test={len(_LOADER_CACHE[img_size][2])} "
+              f"from {list(VARIANT_DIRS.values())}")
+    return _LOADER_CACHE[img_size]
 
-print("Loaders are built lazily per model (224 or 299) in §9.")""")
+print("Loaders are built lazily per required img_size (224 or 299) in §9, pooling both dataset folders.")""")
 
 # ============================================================================
 md(r"""## §6 · Model zoo — 6 architectures
@@ -583,17 +609,19 @@ class OAHANet(nn.Module):
 print("OA-HANet defined:", OAHANET_CNN, "x", SWIN_BACKBONE)""")
 
 co(r"""# -------- the 6-model registry --------
+# 'img_size' is only the model's native resize target — every model's loader still pools BOTH
+# kneeKL224 and kneeKL299 (see §5 get_loaders); img_size just controls the on-the-fly resize.
 MODEL_SPECS = {
-    "ResNet50":         dict(variant=224, multihead=False, builder=lambda: TimmClassifier(["resnet50"])),
-    "InceptionV3":      dict(variant=299, multihead=False, builder=lambda: TimmClassifier(["inception_v3"])),
-    "MobileNetV1":      dict(variant=224, multihead=False,
+    "ResNet50":         dict(img_size=224, multihead=False, builder=lambda: TimmClassifier(["resnet50"])),
+    "InceptionV3":      dict(img_size=299, multihead=False, builder=lambda: TimmClassifier(["inception_v3"])),
+    "MobileNetV1":      dict(img_size=224, multihead=False,
                              builder=lambda: TimmClassifier(["mobilenetv1_100",
                                                              "mobilenetv1_100.ra4_e3600_r224_in1k",
                                                              "mobilenet_100"])),
-    "ViT-Base":         dict(variant=224, multihead=False, builder=lambda: TimmClassifier(["vit_base_patch16_224"])),
-    "Swin-Transformer": dict(variant=224, multihead=False,
+    "ViT-Base":         dict(img_size=224, multihead=False, builder=lambda: TimmClassifier(["vit_base_patch16_224"])),
+    "Swin-Transformer": dict(img_size=224, multihead=False,
                              builder=lambda: TimmClassifier([SWIN_BACKBONE, "swin_tiny_patch4_window7_224"])),
-    "OA-HANet":         dict(variant=224, multihead=True, builder=lambda: OAHANet(img_size=224)),
+    "OA-HANet":         dict(img_size=224, multihead=True, builder=lambda: OAHANet(img_size=224)),
 }
 MODEL_NAMES = list(MODEL_SPECS.keys())
 
@@ -607,9 +635,9 @@ for m, spec in MODEL_SPECS.items():
         BACKBONE_USED[m] = f"ERROR: {e}"
     gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
 
-print(f"{len(MODEL_NAMES)} models registered:")
+print(f"{len(MODEL_NAMES)} models registered (all trained on the COMBINED kneeKL224+kneeKL299 pool):")
 for m in MODEL_NAMES:
-    print(f"  • {m:18s} (img {MODEL_SPECS[m]['variant']}) -> {BACKBONE_USED[m]}"
+    print(f"  • {m:18s} (native img {MODEL_SPECS[m]['img_size']}) -> {BACKBONE_USED[m]}"
           f"{'  [multi-head: +ordinal +early-grade]' if MODEL_SPECS[m]['multihead'] else ''}")""")
 
 # ============================================================================
@@ -764,8 +792,8 @@ def predict(model, loader):
 def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
     # trains one model end-to-end (single-head or OA-HANet multi-head), returns a results dict
     spec = MODEL_SPECS[name]
-    img_size = spec["variant"]
-    tr, va, te, tl, vl, tel = get_loaders(img_size)
+    img_size = spec["img_size"]
+    tr, va, te, tl, vl, tel = get_loaders(img_size)      # pooled kneeKL224 + kneeKL299
     class_w = compute_weights(tr) if USE_CLASS_WEIGHTS else None
 
     t0 = time.time()
