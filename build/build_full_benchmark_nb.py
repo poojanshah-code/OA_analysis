@@ -139,7 +139,7 @@ EG_LOSS_W  = 0.3            # weight of the early-grade (Normal-vs-Doubtful) los
 EG_TEMP    = 0.2            # temperature for the early-grade supervised-contrastive term
 
 # ---- QUICK_TEST: True for a fast smoke-test; False = full paper-grade run ----
-QUICK_TEST = True
+QUICK_TEST = False           # <<< FULL RUN: all 6 models, full data, <=200 epochs, early stopping
 if QUICK_TEST:
     MAX_EPOCHS, PATIENCE, SUBSET = 3, 3, 250
 else:
@@ -1252,12 +1252,20 @@ print("Configure GH_TOKEN / GH_REPO / GH_BRANCH above and uncomment to push resu
 
 md(r"""---
 ### Reproducibility checklist
-1. `QUICK_TEST=True` (default here) for a fast smoke-test that all 6 models train & every figure renders.
-2. Set `QUICK_TEST=False` for the full paper-grade run (≤200 epochs, early stopping patience 20, full data).
+1. **Default `QUICK_TEST=False`** (this notebook) → full paper-grade run (≤200 epochs, early
+   stopping patience 20, full data) — this is what produces the journal numbers.
+2. (Optional) Flip to `QUICK_TEST=True` first only if you want a fast ~10-min smoke-test that all
+   6 models train & every figure renders before committing to the full run.
 3. Read off: §3 dataset composition · §9 training loop · §10 train/val table · §11 learning curves ·
    §12 confusion matrices · §13 classwise metrics · §14 misclassification analysis · §15 confidence
    collages · §16 Grad-CAM · §17 master summary.
 4. §18 → push `results/` to GitHub.
+
+> **Expected time (full run, A100/L4/T4):** 6 models with ≤200 epochs and early stopping (patience
+> 20) each — budget roughly an hour or more depending on GPU and dataset size. Every model is
+> checkpointed to `CKPT_DIR` as it finishes, so §9 is resume-safe: re-running it skips models
+> already saved and reloads their results, and every downstream figure section (§10–§17)
+> regenerates from disk without retraining.
 """)
 
 nb = new_notebook(cells=cells)
