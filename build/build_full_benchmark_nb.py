@@ -949,7 +949,8 @@ def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
                y_true=yt.tolist(), y_pred=yp.tolist(), y_prob=ypr.tolist(), paths=paths,
                params=int(n_all), trainable_params=int(n_tr),
                train_time_s=float(train_time), latency_ms=float(latency_ms),
-               epochs_run=len(hist["train_loss"]), warmup_epochs=warmup_n)
+               epochs_run=len(hist["train_loss"]), warmup_epochs=warmup_n,
+               recipe_version=RECIPE_VERSION)
     with open(os.path.join(CKPT_DIR, f"{name}_result.json"), "w") as f:
         json.dump(res, f)
     del model, opt_a, opt_b
@@ -961,9 +962,28 @@ md(r"""## §9 · Train & test all 6 models
 
 Each model is trained independently and crash-isolated: an OOM or build failure on one model is
 caught, logged, and the loop moves on. Re-running this cell **skips models already saved** in
-`CKPT_DIR`, so you can resume after a disconnect.""")
+`CKPT_DIR` (so you can resume after a disconnect **without losing progress**) — but that means a
+stale `CKPT_DIR` from an older run would otherwise silently mask any change to the training recipe
+above (hyperparameters, unfreeze depth, loss weights, ...) with cached results from the *old*
+recipe. `RECIPE_VERSION` guards against exactly that: whenever the recipe changes, bump this
+string once, and the cell below wipes `CKPT_DIR` **the first time it sees the new version** (via a
+`.cleared_<version>` sentinel file), forcing every model to retrain from scratch under the new
+recipe; re-running the cell again afterwards (same version, e.g. after a disconnect) resumes from
+the freshly cached checkpoints as normal.""")
 
-co(r"""RESULTS = {}
+co(r"""# ---- checkpoint / cache-invalidation policy ----
+RECIPE_VERSION = "v3_2phase_warmup_unfreeze20_cosine_clip"   # bump this whenever the recipe above changes
+_sentinel = os.path.join(CKPT_DIR, f".cleared_{RECIPE_VERSION}")
+if not os.path.exists(_sentinel):
+    shutil.rmtree(CKPT_DIR, ignore_errors=True); os.makedirs(CKPT_DIR, exist_ok=True)
+    open(_sentinel, "w").write("cleared")
+    print(f"RECIPE_VERSION='{RECIPE_VERSION}' is new -> cleared ALL cached checkpoints/results; "
+          f"every model retrains from scratch under this recipe.")
+else:
+    print(f"RECIPE_VERSION='{RECIPE_VERSION}' unchanged -> resuming from cached checkpoints "
+          f"in {CKPT_DIR} if present (safe to re-run after a disconnect).")
+
+RESULTS = {}
 
 def already_done(name):
     p = os.path.join(CKPT_DIR, f"{name}_result.json")
@@ -974,7 +994,8 @@ def already_done(name):
 
 for name in MODEL_NAMES:
     if name in RESULTS or already_done(name):
-        print(f"✓ {name}: loaded cached result (test_acc={RESULTS[name]['test_acc']:.4f})")
+        rv = RESULTS[name].get("recipe_version", "unknown/pre-versioning")
+        print(f"✓ {name}: loaded cached result (recipe={rv}, test_acc={RESULTS[name]['test_acc']:.4f})")
         continue
     print("\n" + "="*78 + f"\n  TRAINING: {name}" +
           ("  [multi-head: +ordinal +early-grade]" if MODEL_SPECS[name]["multihead"] else "") +
