@@ -120,14 +120,15 @@ confusion pairs + misclassified-sample gallery), confidence-score sample collage
 explainability collages, and a master results summary — for all 6 models.
 
 **Important — re-running after a recipe change:** §9 caches each model's results as
-`CKPT_DIR/<model>_result.json` so a disconnect doesn't lose progress (re-running §9 skips models
-already trained). `RESULTS_DIR` in §2 is `BASE_RESULTS_DIR/RECIPE_VERSION` — a **version-specific
-subfolder** — so every distinct `RECIPE_VERSION` gets its own checkpoints/figures/tables on Drive.
-A later run under a *new* `RECIPE_VERSION` can therefore never silently reload a cached result
-produced by an *older* recipe (they simply live in different folders), and nothing from earlier
-runs is ever touched or deleted — old version folders just stay on Drive for comparison.
-Re-running with the *same* `RECIPE_VERSION` still resumes from that version's cache as normal. This
-notebook's shipped `RECIPE_VERSION` is bumped every time the training recipe here changes.
+`CKPT_DIR/<model>_result.json` (`CKPT_DIR` lives under `BASE_RESULTS_DIR`, §2) so a disconnect
+doesn't lose progress — re-running §9 skips models already trained rather than retraining them.
+That check has no way to tell "same recipe, resuming" apart from "recipe changed, please retrain",
+so **the one thing that guarantees a clean run is changing `BASE_RESULTS_DIR` to a new folder** —
+point it at a path that doesn't exist yet and every model retrains from scratch, whatever the
+recipe was last time. Nothing from earlier runs is ever touched or deleted, so old result folders
+stay on Drive for comparison. `RECIPE_VERSION` is stored alongside each cached result purely as a
+label so you can tell which recipe produced a given number — it does **not** by itself force a
+retrain; only `BASE_RESULTS_DIR` does.
 
 ---
 

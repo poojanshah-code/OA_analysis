@@ -117,17 +117,19 @@ md(r"""## §2 · Configuration — edit this cell, then `Runtime → Run all`
 (`kneeKL224`, `kneeKL299`), each with `train/ val/ test/` and 5 class sub-folders `0..4`.""")
 
 co(r"""# ============================ USER CONFIG ============================
-ROOT             = "/content/drive/MyDrive/oad"                        # has kneeKL224/ and kneeKL299/
-BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_benchmark_results"  # parent folder on Drive
+ROOT = "/content/drive/MyDrive/oad"   # has kneeKL224/ and kneeKL299/
 
-# RECIPE_VERSION -> RESULTS_DIR is a version-specific SUBFOLDER of BASE_RESULTS_DIR, created fresh
-# the first time this version runs. Bump RECIPE_VERSION whenever you change the training recipe
-# (hyperparameters, unfreeze depth, loss weights, ...) below -- every version then gets its own
-# checkpoints/figures/tables, so a later run can NEVER silently reload a previous recipe's cached
-# results (the §9 already_done() resume-safety check only ever sees files from ITS OWN version),
-# and nothing from earlier runs is ever deleted -- old result folders stay on Drive for comparison.
-RECIPE_VERSION = "v3_2phase_warmup_unfreeze20_cosine_clip"
-RESULTS_DIR = os.path.join(BASE_RESULTS_DIR, RECIPE_VERSION)
+# BASE_RESULTS_DIR is the ONLY thing you need to change to start a completely clean run: point it
+# at a new (not-yet-existing) folder and §9's resume-safety check has nothing old to find there,
+# so every model retrains from scratch under whatever recipe is set below -- no risk of silently
+# reloading a previous run's cached checkpoints/results. Change the suffix (e.g. _run2, _v4, a
+# date) any time you want a fresh folder; nothing from earlier runs is ever touched or deleted, so
+# old result folders stay on Drive for comparison. RECIPE_VERSION is just a metadata tag stored
+# alongside each cached result (see §9) -- it does not affect the path, so bumping it alone is
+# NOT enough to force a clean run; changing BASE_RESULTS_DIR is what actually does that.
+BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_benchmark_results"
+RECIPE_VERSION   = "v3_2phase_warmup_unfreeze20_cosine_clip"
+RESULTS_DIR = BASE_RESULTS_DIR
 
 DATASET_VARIANTS = {224: "kneeKL224", 299: "kneeKL299"}
 labels      = ['0', '1', '2', '3', '4']                 # actual class folder names in oad/
@@ -974,15 +976,17 @@ caught, logged, and the loop moves on. Re-running this cell **skips models alrea
 `CKPT_DIR`, so you can resume after a disconnect **without losing progress or retraining models
 that already finished**.
 
-Because `RESULTS_DIR` is `BASE_RESULTS_DIR/RECIPE_VERSION` (§2), every distinct `RECIPE_VERSION`
-writes to its **own folder** on Drive — a later run under a *new* version can never silently reload
-a cached result produced by an *older* recipe, and nothing from earlier runs is ever touched or
-deleted (old version folders just stay on Drive for comparison). Re-running with the *same*
-`RECIPE_VERSION` still resumes from that version's cache as normal.""")
+That resume-safety check only ever looks inside the current `BASE_RESULTS_DIR` (§2) — it has no
+way to tell "same recipe, resuming" apart from "recipe changed, please retrain", so **changing
+`BASE_RESULTS_DIR` to a new folder is the one thing that guarantees a completely clean run**: point
+it at a path that doesn't exist yet and every model retrains from scratch, no matter what the
+recipe was last time. `RECIPE_VERSION` is recorded alongside each cached result purely so you can
+tell, after the fact, which recipe produced a given number — it is metadata only and does **not**
+by itself force a retrain.""")
 
-co(r"""print(f"RECIPE_VERSION = '{RECIPE_VERSION}'  ->  RESULTS_DIR = {RESULTS_DIR}")
-print("(a different RECIPE_VERSION in §2 would write to a sibling folder under "
-      f"{BASE_RESULTS_DIR}, never reusing this version's cached results)")
+co(r"""print(f"BASE_RESULTS_DIR = {BASE_RESULTS_DIR}  (RECIPE_VERSION tag: '{RECIPE_VERSION}')")
+print("To guarantee a clean run with no risk of reloading old checkpoints, "
+      "change BASE_RESULTS_DIR in §2 to a new folder before Runtime -> Run all.")
 
 RESULTS = {}
 
