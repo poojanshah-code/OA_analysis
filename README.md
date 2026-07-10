@@ -103,6 +103,14 @@ one identical PyTorch/`timm` protocol, no ablation study:
   (grade-distance loss) and an **early-grade discrimination head** (Normal-vs-Doubtful
   contrastive sub-head), trained jointly with the main 5-class head.
 
+**2-phase fine-tuning protocol** (all 6 models): a short head/fusion-only warm-up with the backbone
+fully frozen, then the **entire backbone unfrozen** with differential LR (small on the pretrained
+trunk, larger on the new head/fusion), a linear-warmup + cosine-decay schedule, and gradient
+clipping — this replaced an earlier "unfreeze only the last 20 layers + `ReduceLROnPlateau`" recipe
+that underfit every model (train accuracy plateaued in the 55-67% range). The Otsu/morphology
+preprocessing crop also now falls back to the full CLAHE frame when the detected bounding box is
+implausibly small or large, instead of risking a crop that cuts off the joint.
+
 Produces: dataset composition tables (per-folder AND combined train/val/test totals + classwise
 counts), CLAHE→Otsu preprocessing sanity check, train/val accuracy & loss table, learning curves,
 confusion matrices, classwise precision/recall/F1 table + heatmap, misclassification analysis (top

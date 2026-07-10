@@ -126,22 +126,36 @@ class_short = ['Normal', 'Doubtful', 'Mild', 'Moderate', 'Severe']
 num_classes = len(labels)
 
 BATCH_SIZE    = 32          # lower to 16 if a small GPU OOMs
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-5
 SEED          = 42
-UNFREEZE_LAST = 20          # same fine-tuning depth for every model (unified benchmark protocol)
 USE_AMP       = True        # mixed-precision (fp16) training on GPU
 LABEL_SMOOTHING = 0.1
-HEAD_LR_MULT  = 5.0         # new head/fusion at LR*this; pretrained trunk at LR
 USE_CLASS_WEIGHTS = True    # inverse-frequency weighting in the loss
 SAVE_WEIGHTS  = True        # save each model's best weights (needed for Grad-CAM)
 STAGE_TO_LOCAL = True       # copy dataset from Google Drive to fast local disk
 
+# ---- Fine-tuning protocol (2-phase: head warm-up, then full backbone fine-tune) ----
+# The first pass (UNFREEZE_LAST=20, single-phase, plateau LR schedule) badly underfit every
+# model (train acc plateaued <=67%, val acc tracked train acc closely with a noisy val curve,
+# not classic overfitting) -- the backbone simply wasn't given enough capacity/LR to adapt from
+# ImageNet to knee radiographs. Fix: warm up the new head/fusion for a few epochs with the
+# backbone fully frozen (stabilises the randomly-initialised head before any backbone gradients
+# flow), then fully unfreeze the backbone (differential LR: small on the pretrained trunk, larger
+# on the head/fusion) with a cosine LR schedule (+ short linear warmup) instead of ReduceLROnPlateau,
+# which was halving LR every 5 stagnant epochs and starving fine-tuning before it could progress.
+WARMUP_EPOCHS  = 5           # phase A: head/fusion-only, backbone fully frozen
+FULL_FINETUNE  = True        # phase B: unfreeze the ENTIRE backbone (not just the last N layers)
+UNFREEZE_LAST  = 60          # only used if FULL_FINETUNE=False (partial unfreeze depth)
+LR             = 3e-5        # phase-B backbone LR (low: avoids catastrophic forgetting when fully unfrozen)
+HEAD_LR_MULT   = 15.0        # new head/fusion trains at LR*this (phase A also uses this LR)
+WEIGHT_DECAY   = 1e-5
+GRAD_CLIP      = 1.0         # global-norm gradient clipping (stabilises full fine-tuning)
+LR_WARMUP_EPOCHS = 3         # short linear LR warmup at the *start of phase B* before cosine decay
+
 # ---- OA-HANet specific ----
 SWIN_BACKBONE = 'swin_base_patch4_window7_224'   # -> 'swin_tiny_patch4_window7_224' if low VRAM
 OAHANET_CNN   = 'densenet121'                     # multi-scale CNN reuse branch backbone
-ORD_LOSS_W = 0.3            # weight of the ordinal grade-distance loss
-EG_LOSS_W  = 0.3            # weight of the early-grade (Normal-vs-Doubtful) loss
+ORD_LOSS_W = 0.15           # weight of the ordinal grade-distance loss (lowered: 0.3 was swamping
+EG_LOSS_W  = 0.15           # the main CE term, hence OA-HANet's much higher train/val loss run 1)
 EG_TEMP    = 0.2            # temperature for the early-grade supervised-contrastive term
 
 # ---- QUICK_TEST: True for a fast smoke-test; False = full paper-grade run ----
@@ -149,7 +163,7 @@ QUICK_TEST = False           # <<< FULL RUN: all 6 models, full data, <=200 epoc
 if QUICK_TEST:
     MAX_EPOCHS, PATIENCE, SUBSET = 3, 3, 250
 else:
-    MAX_EPOCHS, PATIENCE, SUBSET = 200, 20, None
+    MAX_EPOCHS, PATIENCE, SUBSET = 200, 25, None
 # ====================================================================
 
 FIG_DIR  = os.path.join(RESULTS_DIR, "figures")
@@ -342,9 +356,16 @@ def _largest_contour_bbox(binary):
     return c, cv2.boundingRect(c)
 
 def _bbox_crop(cl, mask, img_size):
+    # a degenerate Otsu/morphology mask (too small, or near-full-frame) crops away the joint
+    # instead of isolating it -- fall back to the CLAHE full frame instead of feeding a
+    # near-blank or truncated ROI into every model
     contour, bbox = _largest_contour_bbox(mask)
     if bbox is not None:
         x, y, w, h = bbox
+        frame_area = img_size * img_size
+        bbox_area = w * h
+        if not (0.15 * frame_area <= bbox_area <= 0.97 * frame_area):
+            return cl
         px, py = int(0.08*w), int(0.10*h)
         x1, y1 = max(0, x-px), max(0, y-py)
         x2, y2 = min(img_size, x+w+px), min(img_size, y+h+py)
@@ -644,8 +665,10 @@ for m in MODEL_NAMES:
 md(r"""## §7 · Layer-wise fine-tuning control
 
 `set_finetune(model, n_last)` freezes the whole backbone, then unfreezes only its last `n_last`
-parameterised leaf layers; the custom head / fusion / auxiliary-head modules are always trainable.
-Applied identically to all 6 models for a fair benchmark.""")
+parameterised leaf layers (`n_last=0` freezes the entire backbone; `n_last>=` the total leaf count
+unfreezes it entirely — used for phase-B **full fine-tuning** in §8). The custom head / fusion /
+auxiliary-head modules are always trainable. Applied identically to all 6 models for a fair
+benchmark.""")
 
 co(r"""def _backbone_leaf_modules(model):
     bbs = []
@@ -672,13 +695,16 @@ def _new_param_ids(model):
             ids.update(id(p) for p in getattr(model, attr).parameters())
     return ids
 
-def set_finetune(model, n_last=UNFREEZE_LAST):
+def set_finetune(model, n_last):
+    # n_last=0 freezes the whole backbone (note: leaves[-0:] == leaves[:], so 0 needs a
+    # special case); n_last >= len(leaves) unfreezes it entirely (full fine-tuning).
     for p in model.parameters():
         p.requires_grad = False
     leaves = _backbone_leaf_modules(model)
-    for m in leaves[-n_last:]:
-        for p in m.parameters(recurse=False):
-            p.requires_grad = True
+    if n_last > 0:
+        for m in leaves[-n_last:]:
+            for p in m.parameters(recurse=False):
+                p.requires_grad = True
     for attr in NEW_MODULE_ATTRS:
         if hasattr(model, attr):
             for p in getattr(model, attr).parameters():
@@ -686,6 +712,8 @@ def set_finetune(model, n_last=UNFREEZE_LAST):
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     return n_tr, n_all
+
+FULL_UNFREEZE_N = 10**9   # sentinel: n_last this large always unfreezes the entire backbone
 
 def make_param_groups(model, base_lr=LR, head_mult=HEAD_LR_MULT):
     # two LR groups: pretrained trunk at base_lr, new head/fusion at base_lr*head_mult
@@ -701,11 +729,23 @@ def make_param_groups(model, base_lr=LR, head_mult=HEAD_LR_MULT):
     return groups""")
 
 # ============================================================================
-md(r"""## §8 · Training / evaluation engine (early stopping on val-loss)
+md(r"""## §8 · Training / evaluation engine (2-phase fine-tuning, early stopping on val-loss)
 
-`train_model(name)` handles both the 5 single-head models (`run_epoch` + `CrossEntropyLoss`) and
-OA-HANet's multi-head training (`hybrid_multitask_loss`), so every model goes through the same
-early-stopping / checkpoint / metrics pipeline.""")
+`train_model(name)` runs every model through the same **2-phase** protocol:
+
+* **Phase A (warm-up, `WARMUP_EPOCHS`)** — backbone fully frozen (`set_finetune(model, 0)`), only
+  the new head/fusion/auxiliary-head modules train, at `LR*HEAD_LR_MULT`. This lets the randomly
+  initialised head reach a reasonable starting point before any gradient reaches the pretrained
+  weights, instead of the two fighting each other from epoch 1.
+* **Phase B (fine-tune, remaining epochs)** — the **entire backbone** is unfrozen
+  (`FULL_FINETUNE=True`) with differential LR (small `LR` on the pretrained trunk, `LR*HEAD_LR_MULT`
+  on the head/fusion) and a **short linear LR warmup + cosine decay** schedule (replacing
+  `ReduceLROnPlateau`, which was halving LR every 5 stagnant epochs and starving fine-tuning before
+  the newly-unfrozen backbone could adapt). Global-norm **gradient clipping** (`GRAD_CLIP`)
+  stabilises the larger effective learning signal from a fully-unfrozen backbone.
+
+Both the 5 single-head models (`run_epoch` + `CrossEntropyLoss`) and OA-HANet's multi-head training
+(`hybrid_multitask_loss`) go through the same 2-phase / early-stopping / checkpoint pipeline.""")
 
 co(r"""class EarlyStopping:
     def __init__(self, patience=20, delta=1e-4):
@@ -722,6 +762,15 @@ co(r"""class EarlyStopping:
 
 AMP_ON = bool(USE_AMP) and device.type == "cuda"
 
+def _clip_and_step(model, optimizer, scaler):
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer); scaler.update()
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
+
 def run_epoch(model, loader, criterion, optimizer=None, scaler=None):
     train = optimizer is not None
     model.train() if train else model.eval()
@@ -735,9 +784,10 @@ def run_epoch(model, loader, criterion, optimizer=None, scaler=None):
                 loss = criterion(out, y)
             if train:
                 if scaler is not None:
-                    scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    loss.backward(); optimizer.step()
+                    loss.backward()
+                _clip_and_step(model, optimizer, scaler)
             running += loss.item() * imgs.size(0)
             preds.extend(out.argmax(1).detach().cpu().tolist())
             tgts.extend(y.cpu().tolist())
@@ -774,9 +824,10 @@ def run_epoch_multihead(model, loader, class_w, optimizer=None, scaler=None):
                 loss = hybrid_multitask_loss(main, ordp, eg_logits, eg_emb, y, class_w)
             if train:
                 if scaler is not None:
-                    scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    loss.backward(); optimizer.step()
+                    loss.backward()
+                _clip_and_step(model, optimizer, scaler)
             running += loss.item() * imgs.size(0)
             preds.extend(main.argmax(1).detach().cpu().tolist()); tgts.extend(y.cpu().tolist())
     return running/len(loader.dataset), accuracy_score(tgts, preds)
@@ -789,8 +840,36 @@ def predict(model, loader):
         P.extend(prob.argmax(1)); Tt.extend(y.numpy()); PR.extend(prob); PATHS.extend(paths)
     return np.array(P), np.array(Tt), np.array(PR), PATHS
 
+def _make_epoch_fn(model, spec, class_w):
+    if spec["multihead"]:
+        return lambda loader, opt=None, sc=None: run_epoch_multihead(model, loader, class_w, opt, sc)
+    criterion = nn.CrossEntropyLoss(weight=class_w, label_smoothing=LABEL_SMOOTHING)
+    return lambda loader, opt=None, sc=None: run_epoch(model, loader, criterion, opt, sc)
+
+def _run_phase(model, epoch_fn, tl, vl, optimizer, scheduler, scaler, n_epochs, patience,
+              hist, start_ep, max_epochs, verbose, phase_tag):
+    es = EarlyStopping(patience=patience)
+    ep = start_ep
+    for _ in range(n_epochs):
+        ep += 1
+        trl, tra = epoch_fn(tl, optimizer, scaler)
+        val, vaa = epoch_fn(vl)
+        if scheduler is not None:
+            scheduler.step()
+        for k, v in zip(hist, (trl, tra, val, vaa)): hist[k].append(v)
+        if verbose:
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print(f"   [{phase_tag}] ep {ep:3d}/{max_epochs} | tr_loss {trl:.4f} acc {tra:.4f} | "
+                  f"val_loss {val:.4f} acc {vaa:.4f} | lr {cur_lr:.2e}")
+        es.step(val, model)
+        if es.stop:
+            if verbose: print(f"   [{phase_tag}] early stop @ {ep}")
+            break
+    return es, ep
+
 def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
-    # trains one model end-to-end (single-head or OA-HANet multi-head), returns a results dict
+    # trains one model end-to-end (single-head or OA-HANet multi-head) via the 2-phase protocol
+    # (warm-up head-only, then full backbone fine-tune), returns a results dict
     spec = MODEL_SPECS[name]
     img_size = spec["img_size"]
     tr, va, te, tl, vl, tel = get_loaders(img_size)      # pooled kneeKL224 + kneeKL299
@@ -798,33 +877,43 @@ def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
 
     t0 = time.time()
     model = spec["builder"]().to(device)
-    n_tr, n_all = set_finetune(model, UNFREEZE_LAST)
-    optimizer = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=5)
-    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ON)
-    es = EarlyStopping(patience=patience)
     hist = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
+    epoch_fn = _make_epoch_fn(model, spec, class_w)
 
-    if spec["multihead"]:
-        epoch_fn = lambda loader, opt=None: run_epoch_multihead(model, loader, class_w, opt, scaler)
+    # ---- Phase A: head/fusion-only warm-up, backbone fully frozen ----
+    warmup_n = min(WARMUP_EPOCHS, max_epochs)
+    set_finetune(model, 0)
+    opt_a = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
+    scaler_a = torch.cuda.amp.GradScaler(enabled=AMP_ON)
+    es_a, ep = _run_phase(model, epoch_fn, tl, vl, opt_a, None, scaler_a, warmup_n,
+                          max(patience, warmup_n + 1), hist, 0, max_epochs, verbose, "warm-up")
+
+    # ---- Phase B: full backbone fine-tune, differential LR, linear-warmup + cosine decay ----
+    n_last = FULL_UNFREEZE_N if FULL_FINETUNE else UNFREEZE_LAST
+    n_tr, n_all = set_finetune(model, n_last)
+    phase_b_budget = max(1, max_epochs - ep)
+    opt_b = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
+    scaler_b = torch.cuda.amp.GradScaler(enabled=AMP_ON)
+    lr_warmup_n = min(LR_WARMUP_EPOCHS, max(0, phase_b_budget - 1))
+    if lr_warmup_n > 0:
+        sched_b = torch.optim.lr_scheduler.SequentialLR(
+            opt_b,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(opt_b, start_factor=0.1, total_iters=lr_warmup_n),
+                torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=max(1, phase_b_budget - lr_warmup_n),
+                                                           eta_min=LR * 0.01),
+            ],
+            milestones=[lr_warmup_n])
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_w, label_smoothing=LABEL_SMOOTHING)
-        epoch_fn = lambda loader, opt=None: run_epoch(model, loader, criterion, opt, scaler)
+        sched_b = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=phase_b_budget, eta_min=LR * 0.01)
+    es_b, ep = _run_phase(model, epoch_fn, tl, vl, opt_b, sched_b, scaler_b, phase_b_budget,
+                          patience, hist, ep, max_epochs, verbose, "fine-tune")
 
-    for ep in range(1, max_epochs+1):
-        trl, tra = epoch_fn(tl, optimizer)
-        val, vaa = epoch_fn(vl)
-        scheduler.step(val)
-        for k, v in zip(hist, (trl, tra, val, vaa)): hist[k].append(v)
-        if verbose:
-            print(f"   ep {ep:3d}/{max_epochs} | tr_loss {trl:.4f} acc {tra:.4f} | "
-                  f"val_loss {val:.4f} acc {vaa:.4f}")
-        es.step(val, model)
-        if es.stop:
-            if verbose: print(f"   early stop @ {ep}")
-            break
-    if es.best_state is not None:
-        model.load_state_dict(es.best_state)
+    # phase-B (fully fine-tuned) is the authoritative best state
+    if es_b.best_state is not None:
+        model.load_state_dict(es_b.best_state)
+    elif es_a.best_state is not None:
+        model.load_state_dict(es_a.best_state)
     if SAVE_WEIGHTS:
         try:
             torch.save(model.state_dict(), os.path.join(CKPT_DIR, f"{name}.pt"))
@@ -854,10 +943,10 @@ def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
                y_true=yt.tolist(), y_pred=yp.tolist(), y_prob=ypr.tolist(), paths=paths,
                params=int(n_all), trainable_params=int(n_tr),
                train_time_s=float(train_time), latency_ms=float(latency_ms),
-               epochs_run=len(hist["train_loss"]))
+               epochs_run=len(hist["train_loss"]), warmup_epochs=warmup_n)
     with open(os.path.join(CKPT_DIR, f"{name}_result.json"), "w") as f:
         json.dump(res, f)
-    del model, optimizer
+    del model, opt_a, opt_b
     gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
     return res""")
 
