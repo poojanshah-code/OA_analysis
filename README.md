@@ -23,6 +23,26 @@ Conditions”** (Poojan Shah, 24RCP004, Pandit Deendayal Energy University).
 Five KL grades: `0Normal, 1Doubtful, 2Mild, 3Moderate, 4Severe`.
 Splits used in the reference notebooks: **train 1502 · val 458 · test 461**.
 
+### Dataset for `notebooks/05_full_benchmark_6models_OAHANet.ipynb`
+
+This notebook uses the **Knee Osteoarthritis Severity Grading** dataset (Chen et al., Mendeley),
+which ships as two pre-resized variants of the same radiographs under one `oad` folder on Drive:
+
+```
+/content/drive/MyDrive/oad/
+├── kneeKL224/                     # feeds every 224x224 backbone
+│   ├── train/  0/ 1/ 2/ 3/ 4/
+│   ├── val/    0/ 1/ 2/ 3/ 4/
+│   └── test/   0/ 1/ 2/ 3/ 4/
+└── kneeKL299/                     # feeds InceptionV3 (native 299x299 input)
+    ├── train/  0/ 1/ 2/ 3/ 4/
+    ├── val/    0/ 1/ 2/ 3/ 4/
+    └── test/   0/ 1/ 2/ 3/ 4/
+```
+
+Class folders `0..4` are the KL grades (0 Normal … 4 Severe); `kneeKL224` and `kneeKL299` contain
+the same images, so their per-split/per-class counts must match (checked in §3 of the notebook).
+
 ---
 
 ## Notebooks (run on Google Colab → GPU runtime)
@@ -69,6 +89,22 @@ Swin reference:
 Produces the same suite of artefacts plus a per-class recall plot (highlighting G1 recall) and a
 comparison table against the Swin baseline.
 
+### `notebooks/05_full_benchmark_6models_OAHANet.ipynb`
+Benchmark of **6 architectures** on the `oad/kneeKL224` + `oad/kneeKL299` dataset (see Dataset
+section above), under one identical PyTorch/`timm` protocol, no ablation study:
+
+* **ResNet50**, **InceptionV3** (299×299), **MobileNetV1**, **ViT-Base**, **Swin Transformer**
+* **OA-HANet (proposed)** — Swin backbone (global) + multi-scale DenseNet-121 reuse branch (local,
+  read at 3 dense-block stages) fused by cross-attention, plus an **ordinal-aware head**
+  (grade-distance loss) and an **early-grade discrimination head** (Normal-vs-Doubtful
+  contrastive sub-head), trained jointly with the main 5-class head.
+
+Produces: dataset composition table (total + classwise train/val/test counts), CLAHE→Otsu
+preprocessing sanity check, train/val accuracy & loss table, learning curves, confusion matrices,
+classwise precision/recall/F1 table + heatmap, misclassification analysis (top confusion pairs +
+misclassified-sample gallery), confidence-score sample collages, Grad-CAM explainability
+collages, and a master results summary — for all 6 models.
+
 ---
 
 ## How to run
@@ -89,7 +125,7 @@ Input 224×224 · Adam (lr 1e-4) · batch 32 · class-weighted loss · ≤200 ep
 ## Repository structure
 
 ```
-notebooks/   Colab notebooks (ablation + OA-HANet)
+notebooks/   Colab notebooks (ablation, OA-HANet, 6-model benchmark)
 build/        Scripts that generate the notebooks (reproducibility of the notebooks themselves)
 results/      Destination for generated figures/tables (committed as proof)
 requirements.txt
