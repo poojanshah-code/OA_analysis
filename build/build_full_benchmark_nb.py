@@ -127,7 +127,7 @@ ROOT = "/content/drive/MyDrive/oad"   # has kneeKL224/ and kneeKL299/
 # old result folders stay on Drive for comparison. RECIPE_VERSION is just a metadata tag stored
 # alongside each cached result (see §9) -- it does not affect the path, so bumping it alone is
 # NOT enough to force a clean run; changing BASE_RESULTS_DIR is what actually does that.
-BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_benchmark_results"
+BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_6_results"
 RECIPE_VERSION   = "v3_2phase_warmup_unfreeze20_cosine_clip"
 RESULTS_DIR = BASE_RESULTS_DIR
 
