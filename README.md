@@ -121,12 +121,13 @@ explainability collages, and a master results summary — for all 6 models.
 
 **Important — re-running after a recipe change:** §9 caches each model's results as
 `CKPT_DIR/<model>_result.json` so a disconnect doesn't lose progress (re-running §9 skips models
-already trained). If you edit the training recipe (§2 hyperparameters, unfreeze depth, loss
-weights, ...) on top of an existing `RESULTS_DIR`, bump `RECIPE_VERSION` in §9 — it wipes the old
-`CKPT_DIR` the first time it sees a new version string, forcing a clean retrain under the new
-recipe instead of silently reloading stale results from the old one. This notebook's shipped
-`RECIPE_VERSION` is bumped every time the training recipe here changes, so a fresh
-`Runtime → Run all` always retrains under the current recipe.
+already trained). `RESULTS_DIR` in §2 is `BASE_RESULTS_DIR/RECIPE_VERSION` — a **version-specific
+subfolder** — so every distinct `RECIPE_VERSION` gets its own checkpoints/figures/tables on Drive.
+A later run under a *new* `RECIPE_VERSION` can therefore never silently reload a cached result
+produced by an *older* recipe (they simply live in different folders), and nothing from earlier
+runs is ever touched or deleted — old version folders just stay on Drive for comparison.
+Re-running with the *same* `RECIPE_VERSION` still resumes from that version's cache as normal. This
+notebook's shipped `RECIPE_VERSION` is bumped every time the training recipe here changes.
 
 ---
 

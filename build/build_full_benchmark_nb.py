@@ -117,8 +117,17 @@ md(r"""## §2 · Configuration — edit this cell, then `Runtime → Run all`
 (`kneeKL224`, `kneeKL299`), each with `train/ val/ test/` and 5 class sub-folders `0..4`.""")
 
 co(r"""# ============================ USER CONFIG ============================
-ROOT        = "/content/drive/MyDrive/oad"                        # has kneeKL224/ and kneeKL299/
-RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_benchmark_results"  # all figures/tables go here
+ROOT             = "/content/drive/MyDrive/oad"                        # has kneeKL224/ and kneeKL299/
+BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_benchmark_results"  # parent folder on Drive
+
+# RECIPE_VERSION -> RESULTS_DIR is a version-specific SUBFOLDER of BASE_RESULTS_DIR, created fresh
+# the first time this version runs. Bump RECIPE_VERSION whenever you change the training recipe
+# (hyperparameters, unfreeze depth, loss weights, ...) below -- every version then gets its own
+# checkpoints/figures/tables, so a later run can NEVER silently reload a previous recipe's cached
+# results (the §9 already_done() resume-safety check only ever sees files from ITS OWN version),
+# and nothing from earlier runs is ever deleted -- old result folders stay on Drive for comparison.
+RECIPE_VERSION = "v3_2phase_warmup_unfreeze20_cosine_clip"
+RESULTS_DIR = os.path.join(BASE_RESULTS_DIR, RECIPE_VERSION)
 
 DATASET_VARIANTS = {224: "kneeKL224", 299: "kneeKL299"}
 labels      = ['0', '1', '2', '3', '4']                 # actual class folder names in oad/
@@ -962,26 +971,18 @@ md(r"""## §9 · Train & test all 6 models
 
 Each model is trained independently and crash-isolated: an OOM or build failure on one model is
 caught, logged, and the loop moves on. Re-running this cell **skips models already saved** in
-`CKPT_DIR` (so you can resume after a disconnect **without losing progress**) — but that means a
-stale `CKPT_DIR` from an older run would otherwise silently mask any change to the training recipe
-above (hyperparameters, unfreeze depth, loss weights, ...) with cached results from the *old*
-recipe. `RECIPE_VERSION` guards against exactly that: whenever the recipe changes, bump this
-string once, and the cell below wipes `CKPT_DIR` **the first time it sees the new version** (via a
-`.cleared_<version>` sentinel file), forcing every model to retrain from scratch under the new
-recipe; re-running the cell again afterwards (same version, e.g. after a disconnect) resumes from
-the freshly cached checkpoints as normal.""")
+`CKPT_DIR`, so you can resume after a disconnect **without losing progress or retraining models
+that already finished**.
 
-co(r"""# ---- checkpoint / cache-invalidation policy ----
-RECIPE_VERSION = "v3_2phase_warmup_unfreeze20_cosine_clip"   # bump this whenever the recipe above changes
-_sentinel = os.path.join(CKPT_DIR, f".cleared_{RECIPE_VERSION}")
-if not os.path.exists(_sentinel):
-    shutil.rmtree(CKPT_DIR, ignore_errors=True); os.makedirs(CKPT_DIR, exist_ok=True)
-    open(_sentinel, "w").write("cleared")
-    print(f"RECIPE_VERSION='{RECIPE_VERSION}' is new -> cleared ALL cached checkpoints/results; "
-          f"every model retrains from scratch under this recipe.")
-else:
-    print(f"RECIPE_VERSION='{RECIPE_VERSION}' unchanged -> resuming from cached checkpoints "
-          f"in {CKPT_DIR} if present (safe to re-run after a disconnect).")
+Because `RESULTS_DIR` is `BASE_RESULTS_DIR/RECIPE_VERSION` (§2), every distinct `RECIPE_VERSION`
+writes to its **own folder** on Drive — a later run under a *new* version can never silently reload
+a cached result produced by an *older* recipe, and nothing from earlier runs is ever touched or
+deleted (old version folders just stay on Drive for comparison). Re-running with the *same*
+`RECIPE_VERSION` still resumes from that version's cache as normal.""")
+
+co(r"""print(f"RECIPE_VERSION = '{RECIPE_VERSION}'  ->  RESULTS_DIR = {RESULTS_DIR}")
+print("(a different RECIPE_VERSION in §2 would write to a sibling folder under "
+      f"{BASE_RESULTS_DIR}, never reusing this version's cached results)")
 
 RESULTS = {}
 
