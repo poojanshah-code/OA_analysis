@@ -122,10 +122,13 @@ one-off publication figures in the original reference notebook, are 10-100x slow
 across a 200-epoch × 6-model × full-fine-tune run). Training transforms also add a light
 `RandomErasing` regulariser, since fully fine-tuning every backbone raises overfitting risk.
 
-**Hyperparameter sweep** (§9B): for the 2 best models from §9, compares **batch size** (16 vs 32) ×
-**optimizer** (AdamW vs SGD+Nesterov momentum, LR-scaled appropriately for SGD) under the same
-2-phase protocol but a capped epoch budget — a relative comparison, not full convergence. Cached
-per `(model, batch_size, optimizer)` combination, same resume-safety as §9.
+**Hyperparameter sweep** (§9B): full combinatorial sweep — **batch size** `{16, 32, 64}` ×
+**optimizer** `{AdamW, SGD+Nesterov, Adam, RMSprop}` (LR-scaled appropriately for SGD) × **all 6
+models** = **72 training runs**, each under the exact same 2-phase protocol and epoch
+budget/early-stopping patience as §9 (no artificial epoch cap — every run trains until its own
+early stopping triggers). This is substantially more compute than §9 alone; cached per
+`(model, batch_size, optimizer)` combination with the same resume-safety, so a multi-session run is
+expected and safe.
 
 Produces: dataset composition tables (per-folder AND combined train/val/test totals + classwise
 counts), preprocessing sanity check, train/val accuracy & loss table, batch-size×optimizer sweep
