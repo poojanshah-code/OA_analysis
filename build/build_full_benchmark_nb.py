@@ -54,8 +54,9 @@ examples versus using a single variant.
 |-------------|---------|
 | Dataset preparation combining `oad/kneeKL224` + `oad/kneeKL299` | §2–§3 |
 | Per-folder AND combined train/val/test image counts + classwise counts (printed + table) | §3 |
-| Shared CLAHE→Otsu→morphology preprocessing (same as reference pipeline) | §4 |
+| Denoise → CLAHE+gamma → fused Otsu/adaptive segmentation preprocessing | §4 |
 | Train Acc / Train Loss / Val Acc / Val Loss table — all 6 models | §9 |
+| Batch-size × optimizer hyperparameter sweep — best-2 models | §9B |
 | Learning curves (accuracy & loss) — all 6 models | §10 |
 | Confusion matrices — all 6 models | §11 |
 | Classwise classification metrics (precision/recall/F1) — table + heatmap | §12 |
@@ -1055,6 +1056,150 @@ BEST2 = ranked[:2]
 print("\nBEST 2 MODELS:", BEST2)""")
 
 # ============================================================================
+md(r"""## §9B · Hyperparameter sweep — batch size × optimizer (best-2 models)
+
+For the 2 best models from §9 (by test accuracy), this compares **batch size** (`16` vs `32`) ×
+**optimizer** (`AdamW` vs `SGD` + Nesterov momentum) — the other two knobs commonly tuned alongside
+fine-tuning depth — under the *same* 2-phase warm-up/fine-tune protocol as §8, but with a **capped
+epoch budget** (`SWEEP_MAX_EPOCHS`, shorter patience): the sweep needs a *relative* comparison
+between configurations, not each one trained to full convergence. SGD conventionally needs a much
+larger LR than Adam-family optimizers for a comparable step size, so its LR is scaled up via
+`OPTIMIZER_LR_SCALE` rather than reused as-is (an apples-to-oranges comparison otherwise). Each
+`(model, batch_size, optimizer)` combination is cached under `CKPT_DIR` so this cell is
+resume-safe, same as §9.""")
+
+co(r"""SWEEP_MAX_EPOCHS  = min(MAX_EPOCHS, 60)   # capped budget -- sweep needs relative comparison, not max convergence
+SWEEP_PATIENCE    = 10
+SWEEP_BATCH_SIZES = [16, 32]
+SWEEP_OPTIMIZERS  = ["AdamW", "SGD"]
+OPTIMIZER_LR_SCALE = {"AdamW": 1.0, "SGD": 100.0}   # SGD needs a much larger LR than Adam-family
+
+def build_optimizer(opt_name, param_groups):
+    if opt_name == "AdamW":
+        return torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
+    if opt_name == "SGD":
+        return torch.optim.SGD(param_groups, momentum=0.9, nesterov=True, weight_decay=WEIGHT_DECAY)
+    raise ValueError(f"unknown optimizer {opt_name}")
+
+def make_sweep_loaders(img_size, batch_size):
+    variant_roots = list(VARIANT_DIRS.values())
+    train_tf, eval_tf = build_transforms(img_size)
+    tr = KneeDataset(variant_roots, "train", labels, img_size, True, train_tf, SUBSET)
+    va = KneeDataset(variant_roots, "val",   labels, img_size, True, eval_tf,  SUBSET)
+    te = KneeDataset(variant_roots, "test",  labels, img_size, True, eval_tf,  None)
+    nw = 2
+    return (tr, va, te,
+            DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True),
+            DataLoader(va, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True),
+            DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True))
+
+def train_sweep_config(name, batch_size, opt_name):
+    spec = MODEL_SPECS[name]
+    img_size = spec["img_size"]
+    tr, va, te, tl, vl, tel = make_sweep_loaders(img_size, batch_size)
+    class_w = compute_weights(tr) if USE_CLASS_WEIGHTS else None
+    base_lr = LR * OPTIMIZER_LR_SCALE[opt_name]
+
+    t0 = time.time()
+    model = spec["builder"]().to(device)
+    hist = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
+    epoch_fn = _make_epoch_fn(model, spec, class_w)
+
+    # phase A: head/fusion-only warm-up, backbone fully frozen
+    warmup_n = min(WARMUP_EPOCHS, SWEEP_MAX_EPOCHS)
+    set_finetune(model, 0)
+    opt_a = build_optimizer(opt_name, make_param_groups(model, base_lr=base_lr, head_mult=HEAD_LR_MULT))
+    scaler_a = torch.cuda.amp.GradScaler(enabled=AMP_ON)
+    es_a, ep = _run_phase(model, epoch_fn, tl, vl, opt_a, None, scaler_a, warmup_n,
+                          max(SWEEP_PATIENCE, warmup_n + 1), hist, 0, SWEEP_MAX_EPOCHS, False, "warm-up")
+
+    # phase B: fine-tune (same unfreeze depth as the main §8 recipe), linear-warmup + cosine decay
+    n_last = FULL_UNFREEZE_N if FULL_FINETUNE else UNFREEZE_LAST
+    set_finetune(model, n_last)
+    phase_b_budget = max(1, SWEEP_MAX_EPOCHS - ep)
+    opt_b = build_optimizer(opt_name, make_param_groups(model, base_lr=base_lr, head_mult=HEAD_LR_MULT))
+    scaler_b = torch.cuda.amp.GradScaler(enabled=AMP_ON)
+    lr_warmup_n = min(LR_WARMUP_EPOCHS, max(0, phase_b_budget - 1))
+    if lr_warmup_n > 0:
+        sched_b = torch.optim.lr_scheduler.SequentialLR(
+            opt_b,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(opt_b, start_factor=0.1, total_iters=lr_warmup_n),
+                torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=max(1, phase_b_budget - lr_warmup_n),
+                                                           eta_min=base_lr * 0.01),
+            ],
+            milestones=[lr_warmup_n])
+    else:
+        sched_b = torch.optim.lr_scheduler.CosineAnnealingLR(opt_b, T_max=phase_b_budget, eta_min=base_lr * 0.01)
+    es_b, ep = _run_phase(model, epoch_fn, tl, vl, opt_b, sched_b, scaler_b, phase_b_budget,
+                          SWEEP_PATIENCE, hist, ep, SWEEP_MAX_EPOCHS, False, "fine-tune")
+
+    if es_b.best_state is not None:
+        model.load_state_dict(es_b.best_state)
+    elif es_a.best_state is not None:
+        model.load_state_dict(es_a.best_state)
+    train_time = time.time() - t0
+
+    yp, yt, ypr, paths = predict(model, tel)
+    test_acc = accuracy_score(yt, yp)
+    res = dict(name=name, batch_size=batch_size, optimizer=opt_name, test_acc=float(test_acc),
+               val_acc=float(hist["val_acc"][-1]) if hist["val_acc"] else float("nan"),
+               val_loss=float(hist["val_loss"][-1]) if hist["val_loss"] else float("nan"),
+               epochs_run=len(hist["train_loss"]), train_time_s=float(train_time))
+    del model, opt_a, opt_b
+    gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
+    return res
+
+sweep_rows = []
+for n in BEST2:
+    for bs in SWEEP_BATCH_SIZES:
+        for opt_name in SWEEP_OPTIMIZERS:
+            tag = f"{n}__bs{bs}__opt{opt_name}"
+            ck = os.path.join(CKPT_DIR, f"{tag}_sweep.json")
+            if os.path.exists(ck):
+                with open(ck) as f: r = json.load(f)
+                print(f"✓ {tag}: loaded cached sweep result (test_acc={r['test_acc']:.4f})")
+            else:
+                print(f"\n--- sweep: {n} | batch_size={bs} | optimizer={opt_name} ---")
+                try:
+                    r = train_sweep_config(n, bs, opt_name)
+                    with open(ck, "w") as f: json.dump(r, f)
+                    print(f"  test_acc={r['test_acc']*100:.2f}%  val_acc={r['val_acc']*100:.2f}%  "
+                          f"epochs={r['epochs_run']}  time={r['train_time_s']:.1f}s")
+                except Exception as e:
+                    print(f"  !! sweep failed for {tag}: {type(e).__name__}: {e}")
+                    continue
+            sweep_rows.append([n, bs, opt_name, round(r["test_acc"]*100, 2), round(r["val_acc"]*100, 2),
+                               round(r["val_loss"], 4), r["epochs_run"], round(r["train_time_s"], 1)])
+
+sweep_df = pd.DataFrame(sweep_rows, columns=["Model", "Batch Size", "Optimizer", "Test Acc (%)",
+                                             "Val Acc (%)", "Val Loss", "Epochs", "Train time (s)"])
+sweep_df.to_csv(os.path.join(RESULTS_DIR, "table_hparam_sweep_batch_optimizer.csv"), index=False)
+print("\n", sweep_df.to_string(index=False))""")
+
+co(r"""render_df_table(sweep_df, "Hyperparameter sweep — batch size x optimizer (best-2 models)",
+                "table_hparam_sweep_batch_optimizer.png", left_cols=("Model", "Optimizer"))
+
+fig, axes = plt.subplots(1, len(BEST2), figsize=(6*len(BEST2), 5))
+axes = np.atleast_1d(axes)
+for ax, n in zip(axes, BEST2):
+    sub = sweep_df[sweep_df.Model == n]
+    x = np.arange(len(SWEEP_BATCH_SIZES)); w = 0.35
+    for i, opt_name in enumerate(SWEEP_OPTIMIZERS):
+        vals = []
+        for bs in SWEEP_BATCH_SIZES:
+            match = sub[(sub["Batch Size"] == bs) & (sub["Optimizer"] == opt_name)]["Test Acc (%)"]
+            vals.append(match.values[0] if len(match) else np.nan)
+        ax.bar(x + (i - 0.5) * w, vals, w, label=opt_name)
+    ax.set_xticks(x); ax.set_xticklabels(SWEEP_BATCH_SIZES)
+    ax.set_xlabel("Batch size"); ax.set_ylabel("Test accuracy (%)")
+    ax.set_title(n); ax.legend(); ax.grid(axis="y", alpha=0.3)
+fig.suptitle("Hyperparameter sweep — batch size × optimizer", fontweight="bold")
+plt.tight_layout(rect=[0, 0, 1, 0.94])
+plt.savefig(os.path.join(FIG_DIR, "bar_hparam_sweep.png"), dpi=160, bbox_inches="tight")
+plt.show()""")
+
+# ============================================================================
 md(r"""## §10 · Table — Train Acc / Train Loss / Val Acc / Val Loss (all 6 models)""")
 
 co(r"""def best_epoch_metrics(h):
@@ -1436,9 +1581,10 @@ md(r"""---
    stopping patience 20, full data) — this is what produces the journal numbers.
 2. (Optional) Flip to `QUICK_TEST=True` first only if you want a fast ~10-min smoke-test that all
    6 models train & every figure renders before committing to the full run.
-3. Read off: §3 dataset composition · §9 training loop · §10 train/val table · §11 learning curves ·
-   §12 confusion matrices · §13 classwise metrics · §14 misclassification analysis · §15 confidence
-   collages · §16 Grad-CAM · §17 master summary.
+3. Read off: §3 dataset composition · §9 training loop · §9B batch-size×optimizer sweep (best-2
+   models) · §10 train/val table · §11 learning curves · §12 confusion matrices · §13 classwise
+   metrics · §14 misclassification analysis · §15 confidence collages · §16 Grad-CAM · §17 master
+   summary.
 4. §18 → push `results/` to GitHub.
 
 > **Expected time (full run, A100/L4/T4):** 6 models with ≤200 epochs and early stopping (patience

@@ -122,11 +122,16 @@ one-off publication figures in the original reference notebook, are 10-100x slow
 across a 200-epoch × 6-model × full-fine-tune run). Training transforms also add a light
 `RandomErasing` regulariser, since fully fine-tuning every backbone raises overfitting risk.
 
+**Hyperparameter sweep** (§9B): for the 2 best models from §9, compares **batch size** (16 vs 32) ×
+**optimizer** (AdamW vs SGD+Nesterov momentum, LR-scaled appropriately for SGD) under the same
+2-phase protocol but a capped epoch budget — a relative comparison, not full convergence. Cached
+per `(model, batch_size, optimizer)` combination, same resume-safety as §9.
+
 Produces: dataset composition tables (per-folder AND combined train/val/test totals + classwise
-counts), preprocessing sanity check, train/val accuracy & loss table, learning curves, confusion
-matrices, classwise precision/recall/F1 table + heatmap, misclassification analysis (top confusion
-pairs + misclassified-sample gallery), confidence-score sample collages, Grad-CAM explainability
-collages, and a master results summary — for all 6 models.
+counts), preprocessing sanity check, train/val accuracy & loss table, batch-size×optimizer sweep
+table + chart, learning curves, confusion matrices, classwise precision/recall/F1 table + heatmap,
+misclassification analysis (top confusion pairs + misclassified-sample gallery), confidence-score
+sample collages, Grad-CAM explainability collages, and a master results summary — for all 6 models.
 
 > **Honest expectation-setting:** the `oad` (Chen) Knee Osteoarthritis Severity Grading dataset is
 > a well-known **hard** 5-class KL-grading benchmark — published exact-accuracy results with
