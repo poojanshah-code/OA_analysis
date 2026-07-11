@@ -14,15 +14,16 @@ md(r"""# Knee Osteoarthritis (KL-Grade) Benchmark — 6 Architectures incl. Prop
 ---
 Single, end-to-end, Colab-GPU **PyTorch/timm** notebook that trains and evaluates **6
 architectures** under one identical protocol on the **`oad` dataset** (Chen et al. Knee
-Osteoarthritis Severity Grading, Mendeley), which ships as two pre-resized variants:
+Osteoarthritis Severity Grading, Mendeley), which ships as two pre-resized copies of the same
+radiographs:
 
 ```
 /content/drive/MyDrive/oad/
-├── kneeKL224/
+├── kneeKL224/                     # <- used for training/val/test (ACTIVE_DATASET)
 │   ├── train/  0/ 1/ 2/ 3/ 4/
 │   ├── val/    0/ 1/ 2/ 3/ 4/
 │   └── test/   0/ 1/ 2/ 3/ 4/
-└── kneeKL299/
+└── kneeKL299/                     # <- NOT used (same images, redundant resolution copy)
     ├── train/  0/ 1/ 2/ 3/ 4/
     ├── val/    0/ 1/ 2/ 3/ 4/
     └── test/   0/ 1/ 2/ 3/ 4/
@@ -30,33 +31,35 @@ Osteoarthritis Severity Grading, Mendeley), which ships as two pre-resized varia
 
 Classes `0..4` are the KL grades **0 Normal, 1 Doubtful, 2 Mild, 3 Moderate, 4 Severe**.
 
-**Both dataset folders are combined for every model.** For each split (train/val/test) the file
-lists from `kneeKL224/<split>/<class>` and `kneeKL299/<split>/<class>` are pooled into one dataset,
-so every one of the 6 models is trained, validated and tested on the **union of both resolutions**
-(each sample is resized on-the-fly to the model's native input size — 224 or 299 — regardless of
-which folder it came from). This effectively doubles the number of training/validation/test
-examples versus using a single variant.
+**Only `kneeKL224` is used.** `kneeKL224` and `kneeKL299` are the *same* radiographs at two
+resolutions, not two different datasets — training on both (an earlier version of this notebook
+did) just repeats identical pixel content per image for no additional information, while doubling
+every epoch's cost. Every model, **including InceptionV3**, trains/validates/tests on `kneeKL224`
+at `IMG_SIZE=224` (§2); InceptionV3's usual 299×299 input is simply resized up from that same
+224px source at load time rather than reading a redundant 299px copy of the identical photo. §3
+includes a one-off sanity check confirming `kneeKL224` and `kneeKL299` really do describe the same
+images before `kneeKL299` is set aside.
 
 **Models (6):**
 
-| # | Model | Native input | Notes |
-|---|-------|:-----:|-------|
-| a | **ResNet50** | 224 | timm `resnet50`, ImageNet-pretrained |
-| b | **InceptionV3** | 299 | timm `inception_v3` |
-| c | **MobileNetV1** | 224 | timm `mobilenetv1_100` |
-| d | **ViT-Base** | 224 | timm `vit_base_patch16_224` |
-| e | **Swin Transformer** | 224 | timm `swin_base_patch4_window7_224` |
-| f | **OA-HANet (proposed)** | 224 | Swin backbone + multi-scale DenseNet reuse branch + cross-attention fusion + ordinal-aware head + early-grade discrimination head |
+| # | Model | Notes |
+|---|-------|-------|
+| a | **ResNet50** | timm `resnet50`, ImageNet-pretrained |
+| b | **InceptionV3** | timm `inception_v3` |
+| c | **MobileNetV1** | timm `mobilenetv1_100` |
+| d | **ViT-Base** | timm `vit_base_patch16_224` |
+| e | **Swin Transformer** | timm `swin_base_patch4_window7_224` |
+| f | **OA-HANet (proposed)** | Swin backbone + multi-scale DenseNet reuse branch + cross-attention fusion + ordinal-aware head + early-grade discrimination head |
 
 **What this notebook produces:**
 
 | Deliverable | Section |
 |-------------|---------|
-| Dataset preparation combining `oad/kneeKL224` + `oad/kneeKL299` | §2–§3 |
-| Per-folder AND combined train/val/test image counts + classwise counts (printed + table) | §3 |
+| Dataset preparation from `oad/kneeKL224` (only) | §2–§3 |
+| Train/val/test image counts + classwise counts (printed + table) | §3 |
 | Denoise → CLAHE+gamma → fused Otsu/adaptive segmentation preprocessing | §4 |
 | Train Acc / Train Loss / Val Acc / Val Loss table — all 6 models | §9 |
-| Batch-size × optimizer hyperparameter sweep — all 6 models (72 runs) | §9B |
+| Batch-size × optimizer hyperparameter sweep — all 6 models (24 runs) | §9B |
 | Learning curves (accuracy & loss) — all 6 models | §10 |
 | Confusion matrices — all 6 models | §11 |
 | Classwise classification metrics (precision/recall/F1) — table + heatmap | §12 |
@@ -114,11 +117,20 @@ if device.type == "cuda":
 # ============================================================================
 md(r"""## §2 · Configuration — edit this cell, then `Runtime → Run all`
 
-`ROOT` points at the `oad` folder that contains the two pre-resized dataset variants
-(`kneeKL224`, `kneeKL299`), each with `train/ val/ test/` and 5 class sub-folders `0..4`.""")
+`ROOT` points at the `oad` folder. Only `ACTIVE_DATASET` (`kneeKL224`) is read — `kneeKL299` sits
+alongside it but is the same radiographs at a different resolution, so it is never used.""")
 
 co(r"""# ============================ USER CONFIG ============================
 ROOT = "/content/drive/MyDrive/oad"   # has kneeKL224/ and kneeKL299/
+ORIGINAL_ROOT = ROOT   # kept even after §2B repoints ROOT to local disk, so §3 can still find kneeKL299 on Drive
+
+# oad/kneeKL224 and oad/kneeKL299 are the SAME radiographs at two resolutions, not two different
+# datasets -- pooling both (an earlier version of this notebook did) just trains on duplicate
+# pixel content twice per image for no extra information, and doubles every epoch's cost for
+# nothing. ONLY kneeKL224 is used for training/val/test now, for every model including
+# InceptionV3 (its 299x299-native input is simply resized from the same 224px source at load
+# time -- see §5 -- rather than reading a redundant 299px copy of the identical photo).
+ACTIVE_DATASET = "kneeKL224"
 
 # BASE_RESULTS_DIR is the ONLY thing you need to change to start a completely clean run: point it
 # at a new (not-yet-existing) folder and §9's resume-safety check has nothing old to find there,
@@ -128,14 +140,14 @@ ROOT = "/content/drive/MyDrive/oad"   # has kneeKL224/ and kneeKL299/
 # old result folders stay on Drive for comparison. RECIPE_VERSION is just a metadata tag stored
 # alongside each cached result (see §9) -- it does not affect the path, so bumping it alone is
 # NOT enough to force a clean run; changing BASE_RESULTS_DIR is what actually does that.
-BASE_RESULTS_DIR = "/content/drive/MyDrive/OANET_V3"
-RECIPE_VERSION   = "v4_fullfinetune_advprep"
+BASE_RESULTS_DIR = "/content/drive/MyDrive/Final_OAHANet"
+RECIPE_VERSION   = "v5_kneeKL224_only_2x2sweep"
 RESULTS_DIR = BASE_RESULTS_DIR
 
-DATASET_VARIANTS = {224: "kneeKL224", 299: "kneeKL299"}
 labels      = ['0', '1', '2', '3', '4']                 # actual class folder names in oad/
 class_short = ['Normal', 'Doubtful', 'Mild', 'Moderate', 'Severe']
 num_classes = len(labels)
+IMG_SIZE    = 224           # single input size for every model (incl. InceptionV3 -- see note above)
 
 BATCH_SIZE    = 32          # lower to 16 if a small GPU OOMs
 SEED          = 42
@@ -193,18 +205,22 @@ if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-for sz, sub in DATASET_VARIANTS.items():
-    assert os.path.isdir(os.path.join(ROOT, sub, "train")), \
-        f"{sub}/train not found under ROOT={ROOT}. Fix ROOT/dataset layout in this cell."
+DATASET_ROOT = os.path.join(ROOT, ACTIVE_DATASET)
+train_dir = os.path.join(DATASET_ROOT, "train")
+val_dir   = os.path.join(DATASET_ROOT, "val")
+test_dir  = os.path.join(DATASET_ROOT, "test")
+assert os.path.isdir(train_dir), \
+    f"{ACTIVE_DATASET}/train not found under ROOT={ROOT}. Fix ROOT/dataset layout in this cell."
 print("Config ready | QUICK_TEST =", QUICK_TEST, "| MAX_EPOCHS =", MAX_EPOCHS,
-      "| BATCH_SIZE =", BATCH_SIZE, "| device =", device)""")
+      "| BATCH_SIZE =", BATCH_SIZE, "| ACTIVE_DATASET =", ACTIVE_DATASET, "| device =", device)""")
 
 # ============================================================================
 md(r"""## §2B · Stage the dataset to local disk (fixes Google-Drive `FileNotFoundError`)
 
 Reading thousands of small files straight from a mounted Google Drive is unreliable (Drive FUSE
-intermittently returns *"No such file or directory"* for files that exist). This cell copies **both**
-`kneeKL224` and `kneeKL299` once to Colab's fast local disk and repoints `ROOT` there. Set
+intermittently returns *"No such file or directory"* for files that exist). This cell copies
+**only `kneeKL224`** (the sole `ACTIVE_DATASET`, §2 — `kneeKL299` is intentionally never read) once
+to Colab's fast local disk and repoints `ROOT`/`train_dir`/`val_dir`/`test_dir` there. Set
 `STAGE_TO_LOCAL=False` in §2 to skip.""")
 
 co(r"""import shutil
@@ -219,14 +235,13 @@ def _safe_copy(src, dst, retries=5):
 
 if STAGE_TO_LOCAL and ROOT.startswith("/content/drive"):
     LOCAL_ROOT = "/content/oad_local"
-    for sz, sub in DATASET_VARIANTS.items():
-        src_root = os.path.join(ROOT, sub)
-        dst_root = os.path.join(LOCAL_ROOT, sub)
-        need_copy = not all(os.path.isdir(os.path.join(dst_root, s)) for s in ("train", "val", "test"))
-        if not need_copy:
-            print(f"{sub}: local copy already present at {dst_root}")
-            continue
-        print(f"Staging {sub} Drive -> local disk (one-time)...")
+    src_root = os.path.join(ROOT, ACTIVE_DATASET)
+    dst_root = os.path.join(LOCAL_ROOT, ACTIVE_DATASET)
+    need_copy = not all(os.path.isdir(os.path.join(dst_root, s)) for s in ("train", "val", "test"))
+    if not need_copy:
+        print(f"{ACTIVE_DATASET}: local copy already present at {dst_root}")
+    else:
+        print(f"Staging {ACTIVE_DATASET} Drive -> local disk (one-time)...")
         n_ok = n_bad = 0
         for split in ("train", "val", "test"):
             for cls in labels:
@@ -238,26 +253,30 @@ if STAGE_TO_LOCAL and ROOT.startswith("/content/drive"):
                 for fp in sorted(glob.glob(os.path.join(src_dir, "*"))):
                     ok = _safe_copy(fp, os.path.join(dst_dir, os.path.basename(fp)))
                     n_ok += ok; n_bad += (not ok)
-            print(f"  {sub}/{split}: staged")
+            print(f"  {ACTIVE_DATASET}/{split}: staged")
         print(f"  Done. Copied {n_ok} files ({n_bad} unreadable and skipped).")
     ROOT = LOCAL_ROOT
+    DATASET_ROOT = os.path.join(ROOT, ACTIVE_DATASET)
+    train_dir = os.path.join(DATASET_ROOT, "train")
+    val_dir   = os.path.join(DATASET_ROOT, "val")
+    test_dir  = os.path.join(DATASET_ROOT, "test")
 
-VARIANT_DIRS = {sz: os.path.join(ROOT, sub) for sz, sub in DATASET_VARIANTS.items()}
-print("Active variant roots:", VARIANT_DIRS)""")
+print("Active dataset root:", DATASET_ROOT)""")
 
 # ============================================================================
 md(r"""## §3 · Dataset preparation — image counts (train/val/test, classwise)
 
-Every model in §9 is trained/validated/tested on the **union of `kneeKL224` and `kneeKL299`**
-(§5 pools both folders per split). This section reports counts three ways: (1) `kneeKL224` alone,
-(2) `kneeKL299` alone, (3) the **combined** totals that are actually used for training — each as a
-classwise composition table, plus the combined grand totals per split.""")
+`kneeKL224` (`ACTIVE_DATASET`, §2) is the **only** data used for training/val/test — `kneeKL299` is
+the same radiographs at a different resolution, so it carries no additional information and is
+never read. As a one-off sanity check, this section also counts `kneeKL299` (if present next to
+`ROOT`) purely to confirm the two folders really do describe the same images before we discard
+one of them — not because both are used.""")
 
-co(r"""def count_split_class(variant_root):
-    # returns {split: {class: n}} for one dataset variant root
+co(r"""def count_split_class(dataset_root):
+    # returns {split: {class: n}} for one dataset root
     out = {}
     for split in ("train", "val", "test"):
-        out[split] = {c: len(glob.glob(os.path.join(variant_root, split, c, "*"))) for c in labels}
+        out[split] = {c: len(glob.glob(os.path.join(dataset_root, split, c, "*"))) for c in labels}
     return out
 
 def composition_table(counts, title_tag):
@@ -270,28 +289,28 @@ def composition_table(counts, title_tag):
     df.to_csv(os.path.join(RESULTS_DIR, f"table_dataset_composition_{title_tag}.csv"), index=False)
     return df
 
-variant_counts = {sz: count_split_class(root) for sz, root in VARIANT_DIRS.items()}
+active_counts = count_split_class(DATASET_ROOT)
+active_table = composition_table(active_counts, ACTIVE_DATASET)
+print(f"\n=== {ACTIVE_DATASET} (ACTIVE -- used for training/val/test) — classwise composition ===")
+print(active_table.to_string(index=False))
 
-# ---- combined counts: union of both folders per split/class (what every model actually sees) ----
-combined_counts = {split: {c: sum(variant_counts[sz][split][c] for sz in VARIANT_DIRS)
-                           for c in labels} for split in ("train", "val", "test")}
-
-tables_by_variant = {sz: composition_table(variant_counts[sz], f"kneeKL{sz}") for sz in VARIANT_DIRS}
-combined_table = composition_table(combined_counts, "combined")
-
-for sz, df in tables_by_variant.items():
-    print(f"\n=== kneeKL{sz} — classwise image composition ===")
-    print(df.to_string(index=False))
-
-print("\n=== COMBINED (kneeKL224 + kneeKL299) — classwise image composition ===")
-print(combined_table.to_string(index=False))
-
-# ---- combined totals per split (train count / val count / test count) ----
-combined_split_totals = {s: sum(combined_counts[s].values()) for s in ("train", "val", "test")}
-print("\n=== Combined total images per split (used for training) ===")
-for s, n in combined_split_totals.items():
+active_split_totals = {s: sum(active_counts[s].values()) for s in ("train", "val", "test")}
+print(f"\n=== {ACTIVE_DATASET} total images per split ===")
+for s, n in active_split_totals.items():
     print(f"  {s:5s}: {n}")
-print(f"  TOTAL : {sum(combined_split_totals.values())}")""")
+print(f"  TOTAL : {sum(active_split_totals.values())}")
+
+# ---- one-off sanity check: kneeKL299 should describe the SAME images, confirming it's safe
+# to leave unused rather than a silently different (and therefore missed) dataset ----
+_other_root = os.path.join(ORIGINAL_ROOT, "kneeKL299")
+if os.path.isdir(_other_root):
+    other_counts = count_split_class(_other_root)
+    mismatch = any(active_counts[s][c] != other_counts[s][c] for s in active_counts for c in labels)
+    print(f"\nkneeKL299 present -- same image counts as {ACTIVE_DATASET} per split/class:", not mismatch,
+          "(confirms it's a redundant resolution copy, not additional data)")
+else:
+    print("\nkneeKL299 not found alongside ROOT -- skipping the redundancy sanity check "
+          "(harmless; it is not used for training regardless).")""")
 
 co(r"""def render_df_table(df, title, fname, fontsize=9, left_cols=(), shorten_cols=()):
     # renders a DataFrame as a clean matplotlib table with content-proportional column
@@ -320,16 +339,11 @@ co(r"""def render_df_table(df, title, fname, fontsize=9, left_cols=(), shorten_c
     plt.tight_layout()
     plt.savefig(os.path.join(FIG_DIR, fname), dpi=170, bbox_inches="tight"); plt.show()
 
-for sz, df in tables_by_variant.items():
-    render_df_table(df, f"Dataset composition — kneeKL{sz} — images per KL grade × split",
-                    f"table_dataset_composition_kneeKL{sz}.png", left_cols=("KL Grade",))
+render_df_table(active_table, f"Dataset composition — {ACTIVE_DATASET} — images per KL grade × split",
+                f"table_dataset_composition_{ACTIVE_DATASET}.png", left_cols=("KL Grade",))
 
-render_df_table(combined_table, "Dataset composition — COMBINED (kneeKL224 + kneeKL299) — "
-                "images per KL grade × split (used for training)",
-                "table_dataset_composition_combined.png", left_cols=("KL Grade",))
-
-# ---- classwise distribution bar chart (combined data actually used for training) ----
-plot_df = combined_table.iloc[:-1]
+# ---- classwise distribution bar chart ----
+plot_df = active_table.iloc[:-1]
 x = np.arange(len(plot_df)); w = 0.27
 fig, ax = plt.subplots(figsize=(9, 5))
 ax.bar(x-w, plot_df["Train"], w, label="Train", color="#08519c")
@@ -337,8 +351,8 @@ ax.bar(x,   plot_df["Val"],   w, label="Val",   color="#41ab5d")
 ax.bar(x+w, plot_df["Test"],  w, label="Test",  color="#fd8d3c")
 ax.set_xticks(x); ax.set_xticklabels(plot_df["KL Grade"], rotation=20, ha="right")
 ax.set_ylabel("Image count"); ax.legend(); ax.grid(axis="y", alpha=0.3)
-ax.set_title("Combined (kneeKL224 + kneeKL299) class distribution across train/val/test splits")
-plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "bar_dataset_composition_combined.png"), dpi=160,
+ax.set_title(f"{ACTIVE_DATASET} class distribution across train/val/test splits")
+plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "bar_dataset_composition.png"), dpi=160,
                                 bbox_inches="tight"); plt.show()""")
 
 # ============================================================================
@@ -450,30 +464,28 @@ def load_image(path, img_size, preprocess=True):
     g = _to_uint8(cv2.resize(g, (img_size, img_size)))
     return np.stack([g, g, g], axis=-1)
 
-# quick visual sanity check: raw vs preprocessed, one sample per class (kneeKL224)
+# quick visual sanity check: raw vs preprocessed, one sample per class (ACTIVE_DATASET)
 fig, axes = plt.subplots(num_classes, 2, figsize=(4.5, 2.3*num_classes))
 for i, c in enumerate(labels):
-    files = glob.glob(os.path.join(VARIANT_DIRS[224], "train", c, "*"))
+    files = glob.glob(os.path.join(train_dir, c, "*"))
     if not files:
         continue
-    axes[i, 0].imshow(load_image(files[0], 224, False)); axes[i, 0].axis("off")
-    axes[i, 1].imshow(load_image(files[0], 224, True));  axes[i, 1].axis("off")
+    axes[i, 0].imshow(load_image(files[0], IMG_SIZE, False)); axes[i, 0].axis("off")
+    axes[i, 1].imshow(load_image(files[0], IMG_SIZE, True));  axes[i, 1].axis("off")
     axes[i, 0].set_ylabel(f"G{c}:{class_short[i]}", fontsize=9)
 axes[0, 0].set_title("Raw"); axes[0, 1].set_title("CLAHE + Otsu ROI")
-fig.suptitle("Preprocessing sanity check (kneeKL224)", fontweight="bold")
+fig.suptitle(f"Preprocessing sanity check ({ACTIVE_DATASET})", fontweight="bold")
 plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "preprocessing_sanity_check.png"), dpi=140,
                                 bbox_inches="tight"); plt.show()""")
 
 # ============================================================================
-md(r"""## §5 · Datasets, transforms & loaders (both dataset folders pooled)
+md(r"""## §5 · Datasets, transforms & loaders (single dataset, shared by all 6 models)
 
-`KneeDataset` now takes **all variant roots** (`kneeKL224` *and* `kneeKL299`) and, for a given
-split, concatenates the file lists from every root — so the effective train/val/test sets are the
-**union** of both folders (matching the combined counts printed in §3). Every image is resized to
-the target model's native `img_size` (224 or 299) at load time regardless of which folder it came
-from, so this works uniformly for all 6 models. Loaders are cached per `img_size`. Training
-transforms add a light `RandomErasing` regulariser on top of the usual flip/rotate/colour-jitter —
-useful insurance against overfitting now that §7/§8 fully fine-tune every backbone.""")
+One set of loaders is built once, from `kneeKL224` only, at `IMG_SIZE=224` — every model
+(including InceptionV3, resized from this same 224px source) shares `TR, VA, TE, TL, VL, TEL` and
+`CLASS_W`, matching the reference notebook's own single-dataset design. Training transforms add a
+light `RandomErasing` regulariser on top of the usual flip/rotate/colour-jitter — useful insurance
+against overfitting now that §7/§8 fully fine-tune every backbone.""")
 
 co(r"""def build_transforms(img_size):
     train_tf = T.Compose([
@@ -488,14 +500,13 @@ co(r"""def build_transforms(img_size):
     return train_tf, eval_tf
 
 class KneeDataset(Dataset):
-    def __init__(self, variant_roots, split, classes, img_size, preprocess, transforms, subset=None):
+    def __init__(self, root_dir, classes, img_size, preprocess, transforms, subset=None):
         self.img_size, self.preprocess, self.transforms = img_size, preprocess, transforms
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         self.samples = []
-        for root in variant_roots:                         # pool kneeKL224 + kneeKL299
-            for c in classes:
-                for f in sorted(glob.glob(os.path.join(root, split, c, "*"))):
-                    self.samples.append((f, self.class_to_idx[c]))
+        for c in classes:
+            for f in sorted(glob.glob(os.path.join(root_dir, c, "*"))):
+                self.samples.append((f, self.class_to_idx[c]))
         if subset:
             random.Random(SEED).shuffle(self.samples)
             self.samples = self.samples[:subset]
@@ -511,34 +522,27 @@ class KneeDataset(Dataset):
         path, y = self.samples[i]
         return self.transforms(load_image(path, self.img_size, self.preprocess)), y, path
 
-def make_loaders(img_size, preprocess=True, subset=SUBSET):
-    variant_roots = list(VARIANT_DIRS.values())            # kneeKL224 + kneeKL299 combined
+def make_loaders(img_size, preprocess=True, subset=SUBSET, batch_size=BATCH_SIZE):
     train_tf, eval_tf = build_transforms(img_size)
-    tr = KneeDataset(variant_roots, "train", labels, img_size, preprocess, train_tf, subset)
-    va = KneeDataset(variant_roots, "val",   labels, img_size, preprocess, eval_tf,  subset)
-    te = KneeDataset(variant_roots, "test",  labels, img_size, preprocess, eval_tf,  None)
+    tr = KneeDataset(train_dir, labels, img_size, preprocess, train_tf, subset)
+    va = KneeDataset(val_dir,   labels, img_size, preprocess, eval_tf,  subset)
+    te = KneeDataset(test_dir,  labels, img_size, preprocess, eval_tf,  None)
     nw = 2
     return (tr, va, te,
-            DataLoader(tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=nw, pin_memory=True),
-            DataLoader(va, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=True),
-            DataLoader(te, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=True))
+            DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True),
+            DataLoader(va, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True),
+            DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True))
 
 def compute_weights(train_ds):
     y = np.array([t for _, t in train_ds.samples])
     w = compute_class_weight("balanced", classes=np.arange(num_classes), y=y)
     return torch.tensor(w, dtype=torch.float, device=device)
 
-_LOADER_CACHE = {}
-def get_loaders(img_size):
-    if img_size not in _LOADER_CACHE:
-        _LOADER_CACHE[img_size] = make_loaders(img_size)
-        tr = _LOADER_CACHE[img_size][0]
-        print(f"img_size={img_size}: pooled train={len(tr)} "
-              f"val={len(_LOADER_CACHE[img_size][1])} test={len(_LOADER_CACHE[img_size][2])} "
-              f"from {list(VARIANT_DIRS.values())}")
-    return _LOADER_CACHE[img_size]
-
-print("Loaders are built lazily per required img_size (224 or 299) in §9, pooling both dataset folders.")""")
+# single shared set of loaders for every model (matches the reference notebook's design)
+TR, VA, TE, TL, VL, TEL = make_loaders(IMG_SIZE)
+CLASS_W = compute_weights(TR) if USE_CLASS_WEIGHTS else None
+print(f"Loaders built from {ACTIVE_DATASET} | train={len(TR)} val={len(VA)} test={len(TE)}")
+print("Class weights:", None if CLASS_W is None else np.round(CLASS_W.cpu().numpy(), 3))""")
 
 # ============================================================================
 md(r"""## §6 · Model zoo — 6 architectures
@@ -675,19 +679,20 @@ class OAHANet(nn.Module):
 print("OA-HANet defined:", OAHANET_CNN, "x", SWIN_BACKBONE)""")
 
 co(r"""# -------- the 6-model registry --------
-# 'img_size' is only the model's native resize target — every model's loader still pools BOTH
-# kneeKL224 and kneeKL299 (see §5 get_loaders); img_size just controls the on-the-fly resize.
+# Every model shares the same IMG_SIZE=224 loaders from §5 (built from kneeKL224 only) --
+# including InceptionV3, whose 299x299-native input is simply resized up from that same 224px
+# source at load time rather than reading a redundant kneeKL299 copy of the identical photo.
 MODEL_SPECS = {
-    "ResNet50":         dict(img_size=224, multihead=False, builder=lambda: TimmClassifier(["resnet50"])),
-    "InceptionV3":      dict(img_size=299, multihead=False, builder=lambda: TimmClassifier(["inception_v3"])),
-    "MobileNetV1":      dict(img_size=224, multihead=False,
+    "ResNet50":         dict(multihead=False, builder=lambda: TimmClassifier(["resnet50"])),
+    "InceptionV3":      dict(multihead=False, builder=lambda: TimmClassifier(["inception_v3"])),
+    "MobileNetV1":      dict(multihead=False,
                              builder=lambda: TimmClassifier(["mobilenetv1_100",
                                                              "mobilenetv1_100.ra4_e3600_r224_in1k",
                                                              "mobilenet_100"])),
-    "ViT-Base":         dict(img_size=224, multihead=False, builder=lambda: TimmClassifier(["vit_base_patch16_224"])),
-    "Swin-Transformer": dict(img_size=224, multihead=False,
+    "ViT-Base":         dict(multihead=False, builder=lambda: TimmClassifier(["vit_base_patch16_224"])),
+    "Swin-Transformer": dict(multihead=False,
                              builder=lambda: TimmClassifier([SWIN_BACKBONE, "swin_tiny_patch4_window7_224"])),
-    "OA-HANet":         dict(img_size=224, multihead=True, builder=lambda: OAHANet(img_size=224)),
+    "OA-HANet":         dict(multihead=True, builder=lambda: OAHANet(img_size=IMG_SIZE)),
 }
 MODEL_NAMES = list(MODEL_SPECS.keys())
 
@@ -701,9 +706,9 @@ for m, spec in MODEL_SPECS.items():
         BACKBONE_USED[m] = f"ERROR: {e}"
     gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
 
-print(f"{len(MODEL_NAMES)} models registered (all trained on the COMBINED kneeKL224+kneeKL299 pool):")
+print(f"{len(MODEL_NAMES)} models registered (all trained on {ACTIVE_DATASET} at {IMG_SIZE}x{IMG_SIZE}):")
 for m in MODEL_NAMES:
-    print(f"  • {m:18s} (native img {MODEL_SPECS[m]['img_size']}) -> {BACKBONE_USED[m]}"
+    print(f"  • {m:18s} -> {BACKBONE_USED[m]}"
           f"{'  [multi-head: +ordinal +early-grade]' if MODEL_SPECS[m]['multihead'] else ''}")""")
 
 # ============================================================================
@@ -920,14 +925,12 @@ def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
     # trains one model end-to-end (single-head or OA-HANet multi-head) via the 2-phase protocol
     # (warm-up head-only, then full backbone fine-tune), returns a results dict
     spec = MODEL_SPECS[name]
-    img_size = spec["img_size"]
-    tr, va, te, tl, vl, tel = get_loaders(img_size)      # pooled kneeKL224 + kneeKL299
-    class_w = compute_weights(tr) if USE_CLASS_WEIGHTS else None
+    tl, vl, tel = TL, VL, TEL   # shared loaders from §5 (kneeKL224 only, IMG_SIZE for every model)
 
     t0 = time.time()
     model = spec["builder"]().to(device)
     hist = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
-    epoch_fn = _make_epoch_fn(model, spec, class_w)
+    epoch_fn = _make_epoch_fn(model, spec, CLASS_W)
 
     # ---- Phase A: head/fusion-only warm-up, backbone fully frozen ----
     warmup_n = min(WARMUP_EPOCHS, max_epochs)
@@ -984,7 +987,7 @@ def train_model(name, max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True):
     pr, rc, f1, _ = precision_recall_fscore_support(yt, yp, average="macro", zero_division=0)
     per_cls = precision_recall_fscore_support(yt, yp, labels=list(range(num_classes)), zero_division=0)
 
-    res = dict(name=name, timm_name=getattr(model, "timm_name", name), img_size=img_size,
+    res = dict(name=name, timm_name=getattr(model, "timm_name", name), img_size=IMG_SIZE,
                history=hist, test_acc=float(test_acc),
                macro_precision=float(pr), macro_recall=float(rc), macro_f1=float(f1),
                per_class_precision=per_cls[0].tolist(), per_class_recall=per_cls[1].tolist(),
@@ -1058,46 +1061,37 @@ print("\nBEST 2 MODELS:", BEST2)""")
 # ============================================================================
 md(r"""## §9B · Hyperparameter sweep — batch size × optimizer (all 6 models)
 
-Full combinatorial sweep: **batch size** `{16, 32, 64}` × **optimizer** `{AdamW, SGD+Nesterov,
-Adam, RMSprop}` × **all 6 models** = **72 training runs**, each run under the *exact same* 2-phase
+Fixed sweep grid (no more, no fewer): **batch size** `{16, 32}` × **optimizer** `{AdamW,
+SGD+Nesterov}` × **all 6 models** = **24 training runs**, each run under the *exact same* 2-phase
 warm-up/fine-tune protocol as §8/§9 — same `MAX_EPOCHS` and early-stopping `PATIENCE` as the main
 run (no artificial epoch cap: each configuration trains until early stopping decides it has
 stopped improving, same as every other model in this notebook). SGD conventionally needs a much
-larger LR than the three adaptive optimizers (AdamW/Adam/RMSprop) for a comparable step size, so
-its LR is scaled up via `OPTIMIZER_LR_SCALE` rather than reused as-is (an apples-to-oranges
-comparison otherwise).
+larger LR than AdamW for a comparable step size, so its LR is scaled up via `OPTIMIZER_LR_SCALE`
+rather than reused as-is (an apples-to-oranges comparison otherwise).
 
-> **Runtime warning:** this is **72 full training runs** at the same epoch budget as the main
-> benchmark — expect this cell to take **far longer than §9** (likely many hours, probably spanning
-> multiple Colab sessions/disconnects). Every `(model, batch_size, optimizer)` combination is
-> cached under `CKPT_DIR` the moment it finishes, exactly like §9, so re-running this cell after a
-> disconnect **resumes from whichever combinations already finished** instead of restarting the
-> whole sweep. If 72 runs is more than you want, reduce `SWEEP_BATCH_SIZES`/`SWEEP_OPTIMIZERS`/
-> `SWEEP_MODELS` below before running.""")
+> **Runtime note:** this is **24 full training runs** at the same epoch budget as the main
+> benchmark — expect this cell to take noticeably longer than §9 alone. Every
+> `(model, batch_size, optimizer)` combination is cached under `CKPT_DIR` the moment it finishes,
+> exactly like §9, so re-running this cell after a disconnect **resumes from whichever
+> combinations already finished** instead of restarting the whole sweep.""")
 
-co(r"""SWEEP_BATCH_SIZES = [16, 32, 64]
-SWEEP_OPTIMIZERS  = ["AdamW", "SGD", "Adam", "RMSprop"]
-SWEEP_MODELS      = MODEL_NAMES   # all 6 models; narrow this list to reduce the 72-run sweep
-OPTIMIZER_LR_SCALE = {"AdamW": 1.0, "SGD": 100.0, "Adam": 1.0, "RMSprop": 1.0}   # SGD needs a
-                                   # much larger LR than the three adaptive optimizers
+co(r"""SWEEP_BATCH_SIZES = [16, 32]
+SWEEP_OPTIMIZERS  = ["AdamW", "SGD"]
+SWEEP_MODELS      = MODEL_NAMES   # all 6 models
+OPTIMIZER_LR_SCALE = {"AdamW": 1.0, "SGD": 100.0}   # SGD needs a much larger LR than AdamW
 
 def build_optimizer(opt_name, param_groups):
     if opt_name == "AdamW":
         return torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
-    if opt_name == "Adam":
-        return torch.optim.Adam(param_groups, weight_decay=WEIGHT_DECAY)
-    if opt_name == "RMSprop":
-        return torch.optim.RMSprop(param_groups, alpha=0.99, momentum=0.9, weight_decay=WEIGHT_DECAY)
     if opt_name == "SGD":
         return torch.optim.SGD(param_groups, momentum=0.9, nesterov=True, weight_decay=WEIGHT_DECAY)
     raise ValueError(f"unknown optimizer {opt_name}")
 
-def make_sweep_loaders(img_size, batch_size):
-    variant_roots = list(VARIANT_DIRS.values())
-    train_tf, eval_tf = build_transforms(img_size)
-    tr = KneeDataset(variant_roots, "train", labels, img_size, True, train_tf, SUBSET)
-    va = KneeDataset(variant_roots, "val",   labels, img_size, True, eval_tf,  SUBSET)
-    te = KneeDataset(variant_roots, "test",  labels, img_size, True, eval_tf,  None)
+def make_sweep_loaders(batch_size):
+    train_tf, eval_tf = build_transforms(IMG_SIZE)
+    tr = KneeDataset(train_dir, labels, IMG_SIZE, True, train_tf, SUBSET)
+    va = KneeDataset(val_dir,   labels, IMG_SIZE, True, eval_tf,  SUBSET)
+    te = KneeDataset(test_dir,  labels, IMG_SIZE, True, eval_tf,  None)
     nw = 2
     return (tr, va, te,
             DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True),
@@ -1106,8 +1100,7 @@ def make_sweep_loaders(img_size, batch_size):
 
 def train_sweep_config(name, batch_size, opt_name, max_epochs=MAX_EPOCHS, patience=PATIENCE):
     spec = MODEL_SPECS[name]
-    img_size = spec["img_size"]
-    tr, va, te, tl, vl, tel = make_sweep_loaders(img_size, batch_size)
+    tr, va, te, tl, vl, tel = make_sweep_loaders(batch_size)
     class_w = compute_weights(tr) if USE_CLASS_WEIGHTS else None
     base_lr = LR * OPTIMIZER_LR_SCALE[opt_name]
 
@@ -1219,9 +1212,22 @@ plt.savefig(os.path.join(FIG_DIR, "bar_hparam_sweep.png"), dpi=160, bbox_inches=
 plt.show()""")
 
 # ============================================================================
-md(r"""## §10 · Table — Train Acc / Train Loss / Val Acc / Val Loss (all 6 models)""")
+md(r"""## §10 · Table — Train Acc / Train Loss / Val Acc / Val Loss (all 6 models)
 
-co(r"""def best_epoch_metrics(h):
+Includes a **Train-Val Gap** (`Train Acc - Val Acc`) and **Test Acc** column as an explicit
+overfitting diagnostic: strong train accuracy with much weaker val/test accuracy is the classic
+overfitting signature (as opposed to the *underfitting* seen in earlier runs, where train accuracy
+itself was low and val tracked it closely). A row is flagged `⚠ overfit` when the gap exceeds
+`OVERFIT_GAP_THRESHOLD`. This recipe already carries several mitigations that directly target that
+failure mode if it appears — `WEIGHT_DECAY`, `RandomErasing` (§5), label smoothing, class-balanced
+loss, and early stopping on val-loss (which keeps the *pre-overfitting* checkpoint rather than the
+final epoch) — so a flagged row is a cue to strengthen those further (e.g. raise `WEIGHT_DECAY` or
+`RandomErasing`'s `p`/`scale`, or fall back to a partial `UNFREEZE_LAST` instead of
+`FULL_FINETUNE=True`) rather than a sign that nothing is working.""")
+
+co(r"""OVERFIT_GAP_THRESHOLD = 0.15   # Train Acc - Val Acc above this => flagged as likely overfitting
+
+def best_epoch_metrics(h):
     # picks the epoch with lowest val_loss (the kept checkpoint)
     i = int(np.argmin(h["val_loss"]))
     return h["train_acc"][i], h["train_loss"][i], h["val_loss"][i], h["val_acc"][i]
@@ -1230,13 +1236,19 @@ rows = []
 for n in MODEL_NAMES:
     if n not in RESULTS: continue
     ta, tl_, vl_, va = best_epoch_metrics(RESULTS[n]["history"])
-    rows.append([n, round(ta,4), round(tl_,4), round(va,4), round(vl_,4), RESULTS[n]["epochs_run"]])
-train_val_df = pd.DataFrame(rows, columns=["Model", "Train Acc", "Train Loss",
-                                           "Val Acc", "Val Loss", "Epochs"])
+    gap = ta - va
+    flag = "⚠ overfit" if gap > OVERFIT_GAP_THRESHOLD else ""
+    rows.append([n, round(ta,4), round(tl_,4), round(va,4), round(vl_,4),
+                round(RESULTS[n]["test_acc"],4), round(gap,4), RESULTS[n]["epochs_run"], flag])
+train_val_df = pd.DataFrame(rows, columns=["Model", "Train Acc", "Train Loss", "Val Acc", "Val Loss",
+                                           "Test Acc", "Train-Val Gap", "Epochs", "Flag"])
 train_val_df.to_csv(os.path.join(RESULTS_DIR, "table_train_val_metrics.csv"), index=False)
 print(train_val_df.to_string(index=False))
+if (train_val_df["Flag"] == "⚠ overfit").any():
+    print("\nOne or more models show a large train-val gap (possible overfitting) -- see the "
+          "mitigations listed above this cell.")
 render_df_table(train_val_df, "Training / Validation metrics — 6 architectures",
-                "table_train_val_metrics.png", left_cols=("Model",))""")
+                "table_train_val_metrics.png", left_cols=("Model", "Flag"))""")
 
 # ============================================================================
 md(r"""## §11 · Learning curves — accuracy & loss (all 6 models)""")
@@ -1601,19 +1613,18 @@ md(r"""---
 2. (Optional) Flip to `QUICK_TEST=True` first only if you want a fast ~10-min smoke-test that all
    6 models train & every figure renders before committing to the full run.
 3. Read off: §3 dataset composition · §9 training loop · §9B batch-size×optimizer sweep (all 6
-   models, 72 runs) · §10 train/val table · §11 learning curves · §12 confusion matrices · §13
+   models, 24 runs) · §10 train/val table · §11 learning curves · §12 confusion matrices · §13
    classwise metrics · §14 misclassification analysis · §15 confidence collages · §16 Grad-CAM ·
    §17 master summary.
 4. §18 → push `results/` to GitHub.
 
 > **Expected time (full run, A100/L4/T4):** the main §9 run (6 models, ≤200 epochs, early stopping
 > patience 30) budgets roughly an hour or more depending on GPU and dataset size. §9B's
-> batch-size×optimizer sweep is **72 additional full training runs at the same epoch budget** —
-> expect this to take substantially longer than §9 alone (likely several hours to over a day,
-> depending on how early each config's early stopping triggers), probably spanning multiple
-> sessions. Every model/config is checkpointed to `CKPT_DIR` as it finishes, so both §9 and §9B are
-> resume-safe: re-running either cell skips runs already saved and reloads their results, and every
-> downstream figure section (§10–§17) regenerates from disk without retraining.
+> batch-size×optimizer sweep is **24 additional full training runs at the same epoch budget** —
+> expect this to take noticeably longer than §9 alone, depending on how early each config's early
+> stopping triggers. Every model/config is checkpointed to `CKPT_DIR` as it finishes, so both §9
+> and §9B are resume-safe: re-running either cell skips runs already saved and reloads their
+> results, and every downstream figure section (§10–§17) regenerates from disk without retraining.
 """)
 
 nb = new_notebook(cells=cells)
