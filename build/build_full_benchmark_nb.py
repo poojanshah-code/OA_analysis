@@ -127,8 +127,8 @@ ROOT = "/content/drive/MyDrive/oad"   # has kneeKL224/ and kneeKL299/
 # old result folders stay on Drive for comparison. RECIPE_VERSION is just a metadata tag stored
 # alongside each cached result (see §9) -- it does not affect the path, so bumping it alone is
 # NOT enough to force a clean run; changing BASE_RESULTS_DIR is what actually does that.
-BASE_RESULTS_DIR = "/content/drive/MyDrive/OA_HANet_6_results"
-RECIPE_VERSION   = "v3_2phase_warmup_unfreeze20_cosine_clip"
+BASE_RESULTS_DIR = "/content/drive/MyDrive/OANET_V3"
+RECIPE_VERSION   = "v4_fullfinetune_advprep"
 RESULTS_DIR = BASE_RESULTS_DIR
 
 DATASET_VARIANTS = {224: "kneeKL224", 299: "kneeKL299"}
@@ -144,26 +144,27 @@ USE_CLASS_WEIGHTS = True    # inverse-frequency weighting in the loss
 SAVE_WEIGHTS  = True        # save each model's best weights (needed for Grad-CAM)
 STAGE_TO_LOCAL = True       # copy dataset from Google Drive to fast local disk
 
-# ---- Fine-tuning protocol (2-phase: head warm-up, then unfreeze the last N backbone layers) ----
-# The very first pass (UNFREEZE_LAST=20, single-phase, plateau LR schedule) badly underfit every
-# model (train acc plateaued <=67%, val acc tracked train acc closely with a noisy val curve, not
-# classic overfitting). That single-phase recipe had two problems at once: (1) the fresh head and
-# the pretrained trunk started adapting simultaneously from epoch 1, and (2) ReduceLROnPlateau
-# halved the LR every 5 stagnant epochs, starving fine-tuning before the unfrozen layers could
-# adapt. This run keeps the requested last-20-layers unfreeze depth but fixes those two issues:
-# a short head-only warm-up (backbone fully frozen) before any backbone gradients flow, then
-# unfreeze the last UNFREEZE_LAST layers with differential LR (small on the pretrained trunk,
-# larger on the head/fusion), a linear-warmup + cosine-decay schedule (instead of plateau-halving),
-# and global-norm gradient clipping for stability.
+# ---- Fine-tuning protocol (2-phase: head warm-up, then unfreeze the backbone) ----
+# Two prior runs (single-phase UNFREEZE_LAST=20 w/ ReduceLROnPlateau, then 2-phase UNFREEZE_LAST=20
+# w/ cosine schedule) both plateaued with train accuracy itself stuck in the mid-50s-to-70s --
+# classic underfitting, not overfitting (val tracked train closely). Only the last 20 leaf layers
+# of an ImageNet backbone is too shallow a fix for the ImageNet -> knee-radiograph domain gap: most
+# of the network's early/mid feature extractors, tuned for natural-image textures, never adapted.
+# This run switches to FULL fine-tuning (every backbone layer trainable in phase B) -- the standard
+# recipe in the medical-imaging transfer-learning literature for exactly this kind of large domain
+# shift -- with a lower backbone LR (catastrophic-forgetting risk is real once the whole network
+# moves) and a longer warmup so the newly-unfrozen early layers ease in gently. Set
+# FULL_FINETUNE=False (and use UNFREEZE_LAST, e.g. 100) to fall back to a partial unfreeze instead,
+# e.g. if you hit GPU-memory limits with the full backbone trainable.
 WARMUP_EPOCHS  = 5           # phase A: head/fusion-only, backbone fully frozen
-FULL_FINETUNE  = False       # phase B: unfreeze only the last UNFREEZE_LAST backbone layers
-UNFREEZE_LAST  = 20          # fine-tuning depth for every model (unified benchmark protocol)
-LR             = 5e-5        # phase-B backbone LR (only the last 20 layers train, so a bit higher
-                              # than the full-fine-tune LR is safe -- less catastrophic-forgetting risk)
-HEAD_LR_MULT   = 15.0        # new head/fusion trains at LR*this (phase A also uses this LR)
+FULL_FINETUNE  = True        # phase B: unfreeze the ENTIRE backbone (set False to use UNFREEZE_LAST)
+UNFREEZE_LAST  = 100         # only used if FULL_FINETUNE=False (deeper than the last run's 20)
+LR             = 2e-5        # phase-B backbone LR (lower than the partial-unfreeze runs: the whole
+                              # backbone now trains, so catastrophic-forgetting risk is higher)
+HEAD_LR_MULT   = 20.0        # new head/fusion trains at LR*this (phase A also uses this LR)
 WEIGHT_DECAY   = 1e-5
 GRAD_CLIP      = 1.0         # global-norm gradient clipping (stabilises fine-tuning)
-LR_WARMUP_EPOCHS = 3         # short linear LR warmup at the *start of phase B* before cosine decay
+LR_WARMUP_EPOCHS = 5         # short linear LR warmup at the *start of phase B* before cosine decay
 
 # ---- OA-HANet specific ----
 SWIN_BACKBONE = 'swin_base_patch4_window7_224'   # -> 'swin_tiny_patch4_window7_224' if low VRAM
@@ -177,7 +178,7 @@ QUICK_TEST = False           # <<< FULL RUN: all 6 models, full data, <=200 epoc
 if QUICK_TEST:
     MAX_EPOCHS, PATIENCE, SUBSET = 3, 3, 250
 else:
-    MAX_EPOCHS, PATIENCE, SUBSET = 200, 25, None
+    MAX_EPOCHS, PATIENCE, SUBSET = 200, 30, None   # patience raised: full-finetune needs more runway
 # ====================================================================
 
 FIG_DIR  = os.path.join(RESULTS_DIR, "figures")
@@ -340,12 +341,21 @@ plt.tight_layout(); plt.savefig(os.path.join(FIG_DIR, "bar_dataset_composition_c
                                 bbox_inches="tight"); plt.show()""")
 
 # ============================================================================
-md(r"""## §4 · Preprocessing — CLAHE → Otsu → morphology ROI crop
+md(r"""## §4 · Preprocessing — denoise → CLAHE + gamma → fused Otsu/adaptive segmentation → ROI crop
 
-Same fast preprocessing pipeline as the reference benchmark: grayscale → CLAHE (contrast-limited
-adaptive histogram equalisation) → Otsu threshold → morphological close/open → largest-contour
-bounding-box crop. This runs inside every epoch (milliseconds/image), so it is applied identically
-for all 6 models.""")
+Upgraded from a single-threshold pipeline to a more robust (but still epoch-fast) one:
+**edge-preserving bilateral denoise → CLAHE contrast enhancement → gamma correction → a *fused*
+mask combining Otsu's global threshold with an adaptive local threshold** (`OR`-combined, then
+cleaned with a double morphological close/open pass) **→ largest-contour bounding-box crop**. Otsu
+alone is a single global cut that is vulnerable to uneven X-ray exposure across the dataset;
+OR-fusing it with a locally-adaptive threshold recovers joint-margin detail Otsu misses on
+unevenly-exposed radiographs, at the cost of some over-inclusion that the extra morphological
+close/open pass cleans up. All of this still runs in a few milliseconds/image, so it applies
+identically to every model, every epoch. (Heavier techniques such as SLIC, Felzenszwalb, active
+contours or GrabCut exist in the original reference notebook for one-off publication figures —
+they are 10-100x slower per image and are not used here, since running them inside the training
+loop would make a 200-epoch, 6-model, full-fine-tune run impractically slow for no accuracy
+benefit over the fused-threshold approach.)""")
 
 co(r"""def _to_uint8(g):
     # coerces any grayscale array (8/16-bit, float) to single-channel uint8
@@ -360,7 +370,26 @@ co(r"""def _to_uint8(g):
     return np.ascontiguousarray(g.astype(np.uint8))
 
 def _clahe(gray):
-    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    return cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+
+_GAMMA_LUT = (np.linspace(0, 1, 256) ** (1.0 / 1.15) * 255).astype(np.uint8)
+def _gamma_correct(gray):
+    # mild gamma brightening of mid-tones -- makes early-stage osteophytes/JSN more visible
+    # without needing per-image parameter tuning
+    return cv2.LUT(gray, _GAMMA_LUT)
+
+def _fused_mask(cl):
+    # Otsu (single global cut) OR'd with an adaptive local threshold: recovers joint-margin
+    # detail on unevenly-exposed radiographs that a single global threshold misses
+    blur = cv2.GaussianBlur(cl, (5, 5), 0)
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(cl, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY, 35, 5)
+    fused = cv2.bitwise_or(otsu, adaptive)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    fused = cv2.morphologyEx(fused, cv2.MORPH_CLOSE, k, iterations=2)
+    fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, k, iterations=1)
+    return fused
 
 def _largest_contour_bbox(binary):
     cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -370,9 +399,9 @@ def _largest_contour_bbox(binary):
     return c, cv2.boundingRect(c)
 
 def _bbox_crop(cl, mask, img_size):
-    # a degenerate Otsu/morphology mask (too small, or near-full-frame) crops away the joint
-    # instead of isolating it -- fall back to the CLAHE full frame instead of feeding a
-    # near-blank or truncated ROI into every model
+    # a degenerate mask (too small, or near-full-frame) crops away the joint instead of
+    # isolating it -- fall back to the enhanced full frame instead of feeding a near-blank or
+    # truncated ROI into every model
     contour, bbox = _largest_contour_bbox(mask)
     if bbox is not None:
         x, y, w, h = bbox
@@ -390,15 +419,13 @@ def _bbox_crop(cl, mask, img_size):
     return roi
 
 def auto_knee_segment(gray, img_size):
-    # grayscale -> CLAHE -> Otsu -> morphology -> largest-contour bbox crop (fast ROI path)
+    # grayscale -> denoise -> CLAHE + gamma -> fused Otsu/adaptive mask -> bbox crop (fast ROI path)
     gray = _to_uint8(gray)
     gray = cv2.resize(gray, (img_size, img_size))
-    cl = _clahe(gray)
-    blur = cv2.GaussianBlur(cl, (5, 5), 0)
-    _, thb = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    mask = cv2.morphologyEx(thb, cv2.MORPH_CLOSE, k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    den = cv2.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)   # edge-preserving denoise
+    cl = _clahe(den)
+    cl = _gamma_correct(cl)
+    mask = _fused_mask(cl)
     return _bbox_crop(cl, mask, img_size)
 
 def load_image(path, img_size, preprocess=True):
@@ -443,14 +470,17 @@ md(r"""## §5 · Datasets, transforms & loaders (both dataset folders pooled)
 split, concatenates the file lists from every root — so the effective train/val/test sets are the
 **union** of both folders (matching the combined counts printed in §3). Every image is resized to
 the target model's native `img_size` (224 or 299) at load time regardless of which folder it came
-from, so this works uniformly for all 6 models. Loaders are cached per `img_size`.""")
+from, so this works uniformly for all 6 models. Loaders are cached per `img_size`. Training
+transforms add a light `RandomErasing` regulariser on top of the usual flip/rotate/colour-jitter —
+useful insurance against overfitting now that §7/§8 fully fine-tune every backbone.""")
 
 co(r"""def build_transforms(img_size):
     train_tf = T.Compose([
         T.ToPILImage(), T.Resize((img_size, img_size)),
         T.RandomHorizontalFlip(), T.RandomRotation(10),
         T.ColorJitter(brightness=0.1, contrast=0.1),
-        T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
+        T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        T.RandomErasing(p=0.15, scale=(0.02, 0.08))])
     eval_tf = T.Compose([
         T.ToPILImage(), T.Resize((img_size, img_size)),
         T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
@@ -680,11 +710,12 @@ md(r"""## §7 · Layer-wise fine-tuning control
 
 `set_finetune(model, n_last)` freezes the whole backbone, then unfreezes only its last `n_last`
 parameterised leaf layers (`n_last=0` freezes the entire backbone — used for phase A's head-only
-warm-up; `n_last>=` the total leaf count would unfreeze it entirely, for an optional full
-fine-tune). §2 sets `UNFREEZE_LAST=20` and `FULL_FINETUNE=False`, so phase B (§8) unfreezes just
-the **last 20** parameterised leaf layers of every backbone — the same fine-tuning depth for all 6
-models (unified benchmark protocol). The custom head / fusion / auxiliary-head modules are always
-trainable regardless of `n_last`.""")
+warm-up; `n_last>=` the total leaf count unfreezes it entirely). §2 sets `FULL_FINETUNE=True`, so
+phase B (§8) unfreezes the **entire backbone** of every model — the same fine-tuning depth (all of
+it) for all 6 models (unified benchmark protocol). Set `FULL_FINETUNE=False` to fall back to
+partial unfreezing of just the last `UNFREEZE_LAST` layers instead (e.g. under GPU-memory
+pressure). The custom head / fusion / auxiliary-head modules are always trainable regardless of
+`n_last`.""")
 
 co(r"""def _backbone_leaf_modules(model):
     bbs = []
@@ -753,13 +784,13 @@ md(r"""## §8 · Training / evaluation engine (2-phase fine-tuning, early stoppi
   the new head/fusion/auxiliary-head modules train, at `LR*HEAD_LR_MULT`. This lets the randomly
   initialised head reach a reasonable starting point before any gradient reaches the pretrained
   weights, instead of the two fighting each other from epoch 1.
-* **Phase B (fine-tune, remaining epochs)** — the **last `UNFREEZE_LAST` (=20) backbone layers**
-  are unfrozen (set `FULL_FINETUNE=True` in §2 to unfreeze the entire backbone instead) with
-  differential LR (small `LR` on the pretrained trunk, `LR*HEAD_LR_MULT` on the head/fusion) and a
-  **short linear LR warmup + cosine decay** schedule (replacing `ReduceLROnPlateau`, which was
-  halving LR every 5 stagnant epochs and starving fine-tuning before the newly-unfrozen layers
-  could adapt). Global-norm **gradient clipping** (`GRAD_CLIP`) stabilises training once the
-  backbone starts receiving gradients.
+* **Phase B (fine-tune, remaining epochs)** — with `FULL_FINETUNE=True` (§2), the **entire
+  backbone** is unfrozen (set `FULL_FINETUNE=False` and use `UNFREEZE_LAST` for a partial unfreeze
+  instead, e.g. under GPU-memory pressure) with differential LR (small `LR` on the pretrained
+  trunk, `LR*HEAD_LR_MULT` on the head/fusion) and a **short linear LR warmup + cosine decay**
+  schedule (replacing `ReduceLROnPlateau`, which was halving LR every 5 stagnant epochs and
+  starving fine-tuning before the newly-unfrozen layers could adapt). Global-norm **gradient
+  clipping** (`GRAD_CLIP`) stabilises training now that gradients flow through the whole network.
 
 Both the 5 single-head models (`run_epoch` + `CrossEntropyLoss`) and OA-HANet's multi-head training
 (`hybrid_multitask_loss`) go through the same 2-phase / early-stopping / checkpoint pipeline.""")

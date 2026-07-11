@@ -103,21 +103,37 @@ one identical PyTorch/`timm` protocol, no ablation study:
   (grade-distance loss) and an **early-grade discrimination head** (Normal-vs-Doubtful
   contrastive sub-head), trained jointly with the main 5-class head.
 
-**2-phase fine-tuning protocol** (all 6 models, `UNFREEZE_LAST=20`): a short head/fusion-only
-warm-up with the backbone fully frozen, then the **last 20 backbone layers unfrozen** with
-differential LR (small on the pretrained trunk, larger on the new head/fusion), a linear-warmup +
-cosine-decay schedule, and gradient clipping. The original single-phase "unfreeze last 20 layers +
-`ReduceLROnPlateau`" recipe underfit every model (train accuracy plateaued in the 55-67% range) —
-the 2-phase warm-up + cosine schedule + gradient clipping fix that at the same fine-tuning depth
-(set `FULL_FINETUNE=True` in §2 to unfreeze the entire backbone instead). The Otsu/morphology
-preprocessing crop also now falls back to the full CLAHE frame when the detected bounding box is
-implausibly small or large, instead of risking a crop that cuts off the joint.
+**2-phase fine-tuning protocol** (all 6 models): a short head/fusion-only warm-up with the backbone
+fully frozen, then **`FULL_FINETUNE=True` — the entire backbone unfrozen** (set `False` and use
+`UNFREEZE_LAST` for a partial unfreeze instead, e.g. under GPU-memory pressure) with differential
+LR (low on the pretrained trunk, higher on the new head/fusion), a linear-warmup + cosine-decay
+schedule, and gradient clipping. Two prior partial-unfreeze recipes (last-20-layers, first with
+`ReduceLROnPlateau` then with the 2-phase/cosine fixes) both underfit every model — train accuracy
+itself plateaued in the 55-70% range — because only the last 20 layers of an ImageNet backbone is
+too shallow a fix for the ImageNet→knee-radiograph domain shift. Full fine-tuning is the standard
+recipe for exactly this kind of shift in the medical-imaging transfer-learning literature.
+
+**Upgraded preprocessing**: edge-preserving bilateral denoise → CLAHE + gamma correction → a
+**fused Otsu + adaptive-threshold** segmentation mask (OR-combined, then cleaned with a double
+morphological close/open pass) → largest-contour bounding-box crop, with the same fallback to the
+full enhanced frame when the detected box is implausibly small or large. This stays fast enough to
+run inside every epoch (heavier per-image techniques like SLIC/GrabCut/active-contours, used for
+one-off publication figures in the original reference notebook, are 10-100x slower and impractical
+across a 200-epoch × 6-model × full-fine-tune run). Training transforms also add a light
+`RandomErasing` regulariser, since fully fine-tuning every backbone raises overfitting risk.
 
 Produces: dataset composition tables (per-folder AND combined train/val/test totals + classwise
-counts), CLAHE→Otsu preprocessing sanity check, train/val accuracy & loss table, learning curves,
-confusion matrices, classwise precision/recall/F1 table + heatmap, misclassification analysis (top
-confusion pairs + misclassified-sample gallery), confidence-score sample collages, Grad-CAM
-explainability collages, and a master results summary — for all 6 models.
+counts), preprocessing sanity check, train/val accuracy & loss table, learning curves, confusion
+matrices, classwise precision/recall/F1 table + heatmap, misclassification analysis (top confusion
+pairs + misclassified-sample gallery), confidence-score sample collages, Grad-CAM explainability
+collages, and a master results summary — for all 6 models.
+
+> **Honest expectation-setting:** the `oad` (Chen) Knee Osteoarthritis Severity Grading dataset is
+> a well-known **hard** 5-class KL-grading benchmark — published exact-accuracy results with
+> well-tuned CNNs commonly sit in the 60-75% range, since KL grading itself has substantial
+> inter-rater disagreement baked into the ground-truth labels. Full fine-tuning + the upgraded
+> preprocessing above should meaningfully beat the partial-unfreeze runs, but treat 80%+ as an
+> optimistic target rather than a guarantee on this specific dataset.
 
 **Important — re-running after a recipe change:** §9 caches each model's results as
 `CKPT_DIR/<model>_result.json` (`CKPT_DIR` lives under `BASE_RESULTS_DIR`, §2) so a disconnect
