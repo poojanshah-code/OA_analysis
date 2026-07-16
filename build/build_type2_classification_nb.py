@@ -38,6 +38,7 @@ pipeline from raw images to publication-ready results under one identical PyTorc
 | 9 | Misclassified test samples analysed **separately**, with true/predicted label + confidence score per sample, plus a dedicated misclassified-only collage and a cross-model calibration summary | §17B |
 | 10 | Full statistical battery on morphological features: **ANOVA, Kruskal–Wallis, Shapiro-Wilk normality, Levene's variance homogeneity, pairwise Welch t-test, pairwise Mann–Whitney U, Tukey HSD post-hoc** | §19, §19B |
 | 11 | **Always a full run** — no quick-test/smoke-test mode | §2 |
+| 12 | **Improved fine-tuning**: head-warmup phase before unfreezing, EMA-smoothed early stopping with a grace period, more patience, mild extra regularisation, and automatic OOM-retry (fixes the VGG16/VGG19 drop-outs seen in the previous run) | §2, §9 |
 
 **Models (16):** ResNet50V2, ResNet101, DenseNet121, DenseNet169, InceptionV3, Inception-ResNetV2,
 MobileNetV1, MobileNetV2, EfficientNetB0, EfficientNetB3, VGG16, VGG19, ViT-Base, Swin-Transformer,
@@ -138,11 +139,14 @@ class_short  = labels
 num_classes  = len(labels)
 
 IMG_SIZE        = 224
-BATCH_SIZE      = 32          # lower to 16 if a small GPU OOMs
+BATCH_SIZE      = 32          # lower to 16 if a small GPU OOMs; auto-halved per-model on CUDA OOM
+MIN_BATCH_SIZE  = 4           # floor for the automatic OOM-retry backoff
 LR              = 1e-4
-WEIGHT_DECAY    = 1e-5
+WEIGHT_DECAY    = 2e-5        # mildly increased regularisation (the previous run showed a
+                              # sizeable train/val gap on several models, e.g. EfficientNetB0
+                              # 93.3% train vs 81.6% val -> overfitting, not underfitting)
 SEED            = 42
-UNFREEZE_LAST   = 20          # SAME fine-tuning depth for ALL 16 models (unified benchmark protocol)
+UNFREEZE_LAST   = 30          # SAME fine-tuning depth for ALL 16 models (unified benchmark protocol)
 USE_AMP         = True        # mixed-precision (fp16) training on GPU
 LABEL_SMOOTHING = 0.1
 HEAD_LR_MULT    = 5.0         # new head/fusion at LR*this; pretrained trunk at LR
@@ -154,8 +158,21 @@ CLEAR_CHECKPOINTS = False     # set True once to force a clean retrain (e.g. aft
 SPLIT_RATIOS  = (0.70, 0.15, 0.15)   # train / val / test  (Instruction 2)
 AUG_PER_IMAGE = 3                    # medical-image augmentations generated per TRAIN image (Instruction 3)
 
+# ---- Fine-tuning schedule & early-stopping policy ----
+# A previous run showed several models stopping very early (23-40 epochs against a 200-epoch
+# budget, patience 20) right as val_loss got noisy immediately after unfreezing the backbone.
+# Two changes fix this: (1) a HEAD-WARMUP phase trains only the new head/fusion with the backbone
+# fully frozen, so the head is already well-adapted *before* the backbone is unfrozen and the
+# early-stopping clock starts, and (2) MIN_EPOCHS_BEFORE_STOP gives the fine-tuning phase a grace
+# period before the patience counter is allowed to trigger a stop, absorbing the noisy epochs
+# right after unfreezing instead of mistaking them for convergence.
+HEAD_WARMUP_EPOCHS     = 8    # phase 1: frozen backbone, head/fusion only (not early-stopped)
+MIN_EPOCHS_BEFORE_STOP = 15   # phase 2: early stopping cannot fire before this many epochs
+VAL_LOSS_EMA_BETA      = 0.3  # smooths the val-loss signal fed to early stopping (reduces noise-
+                              # driven premature stops); raw val_loss is still logged/plotted as-is
+
 # ---- Full paper-grade run only: no quick-test/smoke-test mode ----
-MAX_EPOCHS, PATIENCE, SUBSET = 200, 20, None   # full reproducible paper run, every time
+MAX_EPOCHS, PATIENCE, SUBSET = 200, 30, None   # more patience so the extra epoch budget gets used
 # ====================================================================
 
 LOCAL_ROOT = "/content/type2_local"       # split, pre-augmentation, pre-segmentation
@@ -823,15 +840,15 @@ class Type2Dataset(Dataset):
         path, y = self.samples[i]
         return self.transforms(self.loader(path)), y, path
 
-def make_loaders(include_aug=True, subset=SUBSET):
+def make_loaders(include_aug=True, subset=SUBSET, batch_size=BATCH_SIZE):
     tr = Type2Dataset(seg_train_dir, labels, train_tf, load_seg_image, include_aug=include_aug, subset=subset)
     va = Type2Dataset(seg_val_dir,   labels, eval_tf,  load_seg_image, include_aug=True, subset=subset)
     te = Type2Dataset(seg_test_dir,  labels, eval_tf,  load_seg_image, include_aug=True, subset=None)
     nw = 2
     return (tr, va, te,
-            DataLoader(tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=nw, pin_memory=True),
-            DataLoader(va, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=True),
-            DataLoader(te, batch_size=BATCH_SIZE, shuffle=False, num_workers=nw, pin_memory=True))
+            DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=nw, pin_memory=True),
+            DataLoader(va, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True),
+            DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=nw, pin_memory=True))
 
 def compute_weights(train_ds):
     y = np.array([t for _, t in train_ds.samples])
@@ -864,9 +881,11 @@ def resolve(cands):
     return None
 
 HEAD_HIDDEN = 256
+HEAD_DROPOUT = 0.5   # bumped from 0.4 -- the previous run showed several models overfitting
+                     # (large train/val gap), so the head is regularised a little harder
 def make_head(in_f, n=num_classes):
     return nn.Sequential(nn.Linear(in_f, HEAD_HIDDEN), nn.ReLU(),
-                         nn.Dropout(0.4), nn.Linear(HEAD_HIDDEN, n))
+                         nn.Dropout(HEAD_DROPOUT), nn.Linear(HEAD_HIDDEN, n))
 
 class TimmClassifier(nn.Module):
     # Standard single-backbone model with the shared head.
@@ -985,10 +1004,13 @@ def _new_param_ids(model):
 def set_finetune(model, n_last=UNFREEZE_LAST):
     for p in model.parameters():
         p.requires_grad = False
-    leaves = _backbone_leaf_modules(model)
-    for m in leaves[-n_last:]:
-        for p in m.parameters(recurse=False):
-            p.requires_grad = True
+    if n_last > 0:
+        # NOTE: leaves[-0:] == leaves[0:] == the WHOLE list in Python, so n_last=0 (the
+        # head-warmup phase) must be guarded explicitly rather than relying on the slice.
+        leaves = _backbone_leaf_modules(model)
+        for m in leaves[-n_last:]:
+            for p in m.parameters(recurse=False):
+                p.requires_grad = True
     for attr in NEW_MODULE_ATTRS:
         if hasattr(model, attr):
             for p in getattr(model, attr).parameters():
@@ -1013,20 +1035,36 @@ def make_param_groups(model, base_lr=LR, head_mult=HEAD_LR_MULT):
 # ============================================================================================
 # SECTION 9 — TRAINING ENGINE
 # ============================================================================================
-md(r"""## §9 · Training / evaluation engine (early stopping on val-loss)""")
+md(r"""## §9 · Training / evaluation engine — two-phase fine-tuning + early stopping
+
+Each model is trained in **two phases**: (1) a **head/fusion warm-up** (`HEAD_WARMUP_EPOCHS`) with
+the backbone fully frozen, so the new classification head is already well-adapted before the
+backbone is touched, then (2) the usual differential-LR fine-tuning phase with the last
+`UNFREEZE_LAST` backbone layers unfrozen. Early stopping only starts counting from phase 2, cannot
+fire before `MIN_EPOCHS_BEFORE_STOP` epochs, and watches an **EMA-smoothed val-loss**
+(`VAL_LOSS_EMA_BETA`) rather than the raw value, so a single noisy epoch right after unfreezing
+doesn't get mistaken for convergence. `train_model()` also **automatically halves the batch size
+and retries** on a CUDA OOM (down to `MIN_BATCH_SIZE`), so large models like VGG16/VGG19 no longer
+silently drop out of the benchmark.""")
 
 co(r"""class EarlyStopping:
-    def __init__(self, patience=20, delta=1e-4):
-        self.patience, self.delta = patience, delta
+    # `min_epochs` gives the (unfrozen) fine-tuning phase a grace period during which the
+    # patience counter still accumulates but `stop` can never fire -- this absorbs the noisy
+    # val-loss swing that happens right after unfreezing the backbone, instead of mistaking it
+    # for convergence and stopping in the first ~20 epochs.
+    def __init__(self, patience=30, delta=1e-4, min_epochs=15):
+        self.patience, self.delta, self.min_epochs = patience, delta, min_epochs
         self.best, self.counter, self.stop, self.best_state = None, 0, False, None
+        self.epoch = 0
     def step(self, val_loss, model):
+        self.epoch += 1
         score = -val_loss
         if self.best is None or score > self.best + self.delta:
             self.best, self.counter = score, 0
             self.best_state = copy.deepcopy(model.state_dict())
         else:
             self.counter += 1
-            self.stop = self.counter >= self.patience
+            self.stop = (self.counter >= self.patience) and (self.epoch >= self.min_epochs)
 
 AMP_ON = bool(USE_AMP) and device.type == "cuda"
 
@@ -1059,28 +1097,47 @@ def predict(model, loader):
         P.extend(prob.argmax(1)); Tt.extend(y.numpy()); PR.extend(prob); PATHS.extend(paths)
     return np.array(P), np.array(Tt), np.array(PR), PATHS
 
-def train_model(name, builder, tl=TL, vl=VL, tel=TEL, n_last=UNFREEZE_LAST,
-                max_epochs=MAX_EPOCHS, patience=PATIENCE, verbose=True, save_weights=None):
+def _train_model_impl(name, builder, tl, vl, tel, batch_size, n_last=UNFREEZE_LAST,
+                      max_epochs=MAX_EPOCHS, patience=PATIENCE, warmup_epochs=HEAD_WARMUP_EPOCHS,
+                      min_epochs=MIN_EPOCHS_BEFORE_STOP, verbose=True, save_weights=None):
     t0 = time.time()
     model = builder().to(device)
-    n_tr, n_all = set_finetune(model, n_last)
     criterion = nn.CrossEntropyLoss(weight=CLASS_W, label_smoothing=LABEL_SMOOTHING)
-    optimizer = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=5)
     scaler = torch.cuda.amp.GradScaler(enabled=AMP_ON)
-    es = EarlyStopping(patience=patience)
     hist = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
-    for ep in range(1, max_epochs+1):
+
+    # ---- Phase 1: head/fusion warm-up, backbone fully frozen (not early-stopped) ----
+    if warmup_epochs > 0:
+        set_finetune(model, n_last=0)
+        warm_opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                     lr=LR * HEAD_LR_MULT, weight_decay=WEIGHT_DECAY)
+        for ep in range(1, warmup_epochs + 1):
+            trl, tra = run_epoch(model, tl, criterion, warm_opt, scaler)
+            val, vaa = run_epoch(model, vl, criterion)
+            for k, v in zip(hist, (trl, tra, val, vaa)): hist[k].append(v)
+            if verbose:
+                print(f"   [warmup] ep {ep:3d}/{warmup_epochs} | tr_loss {trl:.4f} acc {tra:.4f} | "
+                      f"val_loss {val:.4f} acc {vaa:.4f}")
+
+    # ---- Phase 2: unfreeze last n_last layers, differential LR, early stopping ----
+    n_tr, n_all = set_finetune(model, n_last)
+    optimizer = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=6)
+    es = EarlyStopping(patience=patience, min_epochs=min_epochs)
+    remaining = max(1, max_epochs - warmup_epochs)
+    ema_val = None
+    for ep in range(1, remaining + 1):
         trl, tra = run_epoch(model, tl, criterion, optimizer, scaler)
         val, vaa = run_epoch(model, vl, criterion)
-        scheduler.step(val)
+        ema_val = val if ema_val is None else VAL_LOSS_EMA_BETA * val + (1 - VAL_LOSS_EMA_BETA) * ema_val
+        scheduler.step(ema_val)
         for k, v in zip(hist, (trl, tra, val, vaa)): hist[k].append(v)
         if verbose:
-            print(f"   ep {ep:3d}/{max_epochs} | tr_loss {trl:.4f} acc {tra:.4f} | "
-                  f"val_loss {val:.4f} acc {vaa:.4f}")
-        es.step(val, model)
+            print(f"   ep {ep:3d}/{remaining} | tr_loss {trl:.4f} acc {tra:.4f} | "
+                  f"val_loss {val:.4f} (ema {ema_val:.4f}) acc {vaa:.4f}")
+        es.step(ema_val, model)
         if es.stop:
-            if verbose: print(f"   early stop @ {ep}")
+            if verbose: print(f"   early stop @ fine-tune epoch {ep} (warm-up epochs excluded)")
             break
     if es.best_state is not None:
         model.load_state_dict(es.best_state)
@@ -1093,7 +1150,7 @@ def train_model(name, builder, tl=TL, vl=VL, tel=TEL, n_last=UNFREEZE_LAST,
 
     model.eval()
     with torch.no_grad():
-        xb = next(iter(tel))[0][:min(16, BATCH_SIZE)].to(device)
+        xb = next(iter(tel))[0][:min(16, batch_size)].to(device)
         _ = model(xb)
         if device.type == "cuda": torch.cuda.synchronize()
         ti = time.time(); _ = model(xb)
@@ -1113,26 +1170,54 @@ def train_model(name, builder, tl=TL, vl=VL, tel=TEL, n_last=UNFREEZE_LAST,
                y_true=yt.tolist(), y_pred=yp.tolist(), y_prob=ypr.tolist(), paths=paths,
                params=int(n_all), trainable_params=int(n_tr),
                train_time_s=float(train_time), latency_ms=float(latency_ms),
-               epochs_run=len(hist["train_loss"]), n_last=n_last)
+               epochs_run=len(hist["train_loss"]), n_last=n_last, batch_size_used=batch_size)
     with open(os.path.join(CKPT_DIR, f"{name}_result.json"), "w") as f:
         json.dump(res, f)
     del model, optimizer
     gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
-    return res""")
+    return res
+
+def train_model(name, builder, n_last=UNFREEZE_LAST, max_epochs=MAX_EPOCHS, patience=PATIENCE,
+                warmup_epochs=HEAD_WARMUP_EPOCHS, min_epochs=MIN_EPOCHS_BEFORE_STOP,
+                verbose=True, save_weights=None):
+    # OOM-safe retry: some architectures (VGG16/VGG19 in particular, with their large FC layers)
+    # can OOM at the shared BATCH_SIZE even though every other model fits. Rather than losing the
+    # whole model to a silent try/except in the outer training loop, halve the batch size and
+    # retry with freshly built loaders, down to MIN_BATCH_SIZE.
+    batch_size = BATCH_SIZE
+    tl, vl, tel = TL, VL, TEL
+    last_err = None
+    for attempt in range(4):
+        try:
+            return _train_model_impl(name, builder, tl, vl, tel, batch_size, n_last=n_last,
+                                     max_epochs=max_epochs, patience=patience,
+                                     warmup_epochs=warmup_epochs, min_epochs=min_epochs,
+                                     verbose=verbose, save_weights=save_weights)
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower() or batch_size <= MIN_BATCH_SIZE:
+                raise
+            last_err = e
+            gc.collect(); torch.cuda.empty_cache() if device.type == "cuda" else None
+            batch_size = max(MIN_BATCH_SIZE, batch_size // 2)
+            print(f"  CUDA OOM training {name} -- retrying with batch_size={batch_size}")
+            _, _, _, tl, vl, tel = make_loaders(include_aug=True, subset=SUBSET, batch_size=batch_size)
+    raise last_err""")
 
 # ============================================================================================
 # SECTION 10 — TRAIN & TEST ALL 16 MODELS
 # ============================================================================================
 md(r"""## §10 · Train & test all 16 models (Instruction 7)
 
-Each model is trained independently and crash-isolated: an OOM or build failure on one model is
-caught, logged, and the loop moves on. Re-running this cell **skips models already saved** in
-`CKPT_DIR`, so you can resume after a disconnect. `CLEAR_CHECKPOINTS=True` in §2 forces a clean
-retrain.
+Each model is trained independently and crash-isolated: a non-OOM failure on one model is caught,
+logged, and the loop moves on (a CUDA OOM is instead retried at a smaller batch size inside
+`train_model` itself — see §9 — before it would ever reach this outer `except`). Re-running this
+cell **skips models already saved** in `CKPT_DIR`, so you can resume after a disconnect.
+`CLEAR_CHECKPOINTS=True` in §2 forces a clean retrain.
 
-**Unified protocol — identical for all 16 models:** same fine-tuning depth (`UNFREEZE_LAST`), same
-optimiser/early-stopping, same differential-LR rule (new head/fusion at `LR×HEAD_LR_MULT`), same
-label smoothing, class weighting, and input (the U-Net final-ROI images from §5B).""")
+**Unified protocol — identical for all 16 models:** same head-warmup + fine-tuning schedule
+(§9), same fine-tuning depth (`UNFREEZE_LAST`), same optimiser/early-stopping policy, same
+differential-LR rule (new head/fusion at `LR×HEAD_LR_MULT`), same label smoothing, class
+weighting, and input (the U-Net final-ROI images from §5B).""")
 
 co(r"""RESULTS_SENTINEL = os.path.join(CKPT_DIR, ".cleared_type2_v1")
 if CLEAR_CHECKPOINTS and not os.path.exists(RESULTS_SENTINEL):
@@ -1797,8 +1882,10 @@ smoothing → differential LR → cross-attention fusion (hybrids only).
 configuration. Each model is trained under the unified protocol (same `UNFREEZE_LAST`); only the
 component under test changes.""")
 
-co(r"""ABL_EPOCHS   = min(MAX_EPOCHS, 80)
-ABL_PATIENCE = 10
+co(r"""ABL_EPOCHS     = min(MAX_EPOCHS, 80)
+ABL_PATIENCE   = 15
+ABL_MIN_EPOCHS = 10   # same grace-period idea as §9's MIN_EPOCHS_BEFORE_STOP, scaled to ABL_EPOCHS
+ABL_WARMUP     = 5    # same head-warmup idea as §9's HEAD_WARMUP_EPOCHS, scaled to ABL_EPOCHS
 
 HYBRID_CNN = {"Swin+ResNet-XAttn": ["resnet50"], "Swin+DenseNet-XAttn": ["densenet121"]}
 def is_hybrid(name): return name in HYBRID_CNN
@@ -1847,19 +1934,31 @@ def train_ablation(name, cfg):
     tr, va, te, tl, vl, tel = make_ablation_loaders(cfg["use_seg"], cfg["use_aug"])
     w = compute_weights(tr) if cfg["weighted"] else None
     model = build_for_ablation(name, use_xattn=cfg.get("use_xattn", True)).to(device)
-    set_finetune(model, UNFREEZE_LAST)
     crit = nn.CrossEntropyLoss(weight=w, label_smoothing=cfg["smoothing"])
+    sc = torch.cuda.amp.GradScaler(enabled=AMP_ON)
+
+    # Same head-warmup as the main benchmark (§9), applied identically to every ladder step so
+    # it improves training quality without becoming another ablated variable itself.
+    if ABL_WARMUP > 0:
+        set_finetune(model, n_last=0)
+        warm_opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                     lr=LR * HEAD_LR_MULT, weight_decay=WEIGHT_DECAY)
+        for _ in range(ABL_WARMUP):
+            run_epoch(model, tl, crit, warm_opt, sc)
+
+    set_finetune(model, UNFREEZE_LAST)
     if cfg["diff_lr"]:
         opt = torch.optim.AdamW(make_param_groups(model), lr=LR, weight_decay=WEIGHT_DECAY)
     else:
         opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                 lr=LR, weight_decay=WEIGHT_DECAY)
-    sc = torch.cuda.amp.GradScaler(enabled=AMP_ON)
-    es = EarlyStopping(patience=ABL_PATIENCE)
+    es = EarlyStopping(patience=ABL_PATIENCE, min_epochs=ABL_MIN_EPOCHS)
+    ema_val = None
     for ep in range(1, ABL_EPOCHS + 1):
         run_epoch(model, tl, crit, opt, sc)
         vls, _ = run_epoch(model, vl, crit)
-        es.step(vls, model)
+        ema_val = vls if ema_val is None else VAL_LOSS_EMA_BETA * vls + (1 - VAL_LOSS_EMA_BETA) * ema_val
+        es.step(ema_val, model)
         if es.stop: break
     if es.best_state is not None: model.load_state_dict(es.best_state)
     yp, yt, _, _ = predict(model, tel)
