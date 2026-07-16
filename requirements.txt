@@ -8,8 +8,13 @@ grad-cam>=1.5.0
 numpy
 pandas
 scikit-learn
+scikit-image>=0.21
 opencv-python-headless
 matplotlib
 seaborn
 tqdm
 Pillow
+thop
+
+# Augmentation (notebooks/05_type2_segmentation_classification.ipynb)
+albumentations>=1.4
