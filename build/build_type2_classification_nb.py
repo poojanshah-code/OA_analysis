@@ -9,10 +9,16 @@ co = lambda s: cells.append(new_code_cell(s))
 # ============================================================================================
 # TITLE
 # ============================================================================================
-md(r"""# Type2 — 3-Class Medical Image Classification: Segmentation, Augmentation & 16-Architecture Benchmark
+md(r"""[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/poojanshah-code/oa_analysis/blob/claude/type2-medical-classification-y5f0yf/notebooks/05_type2_segmentation_classification.ipynb)
+
+# Type2 — 3-Class Medical Image Classification: Segmentation, Augmentation & 16-Architecture Benchmark
 ### From Raw Drive Folder to Journal-Ready Tables/Figures — CNNs, ViT, Swin & Swin-Cross-Attention Hybrids
 
 **PhD — Deep-Learning Techniques for the Diagnosis & Detection of Orthopedic Conditions** · Poojan Shah
+
+---
+**This is a full paper-grade run only — there is no quick-test/smoke-test mode.** Every cell trains
+to completion (≤200 epochs, early stopping) so every table/figure it produces is publication-ready.
 
 ---
 This is a **single, end-to-end, Colab-GPU notebook** for a **new dataset and new 3-class research
@@ -29,6 +35,9 @@ pipeline from raw images to publication-ready results under one identical PyTorc
 | 6 | Classification models are trained on the **preprocessed, segmented, final-ROI** images (U-Net output), precomputed once to disk | §5B, §6 |
 | 7 | **16 classification architectures**: 2 each of ResNet / DenseNet / InceptionNet / MobileNet / EfficientNet / VGGNet, **plus ViT, Swin, Swin+DenseNet-XAttn, Swin+ResNet-XAttn** | §7 |
 | 8 | Journal-ready **tables, collages, bar charts, heat-maps, Grad-CAM, ablation and time-complexity figures**, all saved as high-DPI PNG/CSV for direct use in a Q1 manuscript | §11–§23 |
+| 9 | Misclassified test samples analysed **separately**, with true/predicted label + confidence score per sample, plus a dedicated misclassified-only collage and a cross-model calibration summary | §17B |
+| 10 | Full statistical battery on morphological features: **ANOVA, Kruskal–Wallis, Shapiro-Wilk normality, Levene's variance homogeneity, pairwise Welch t-test, pairwise Mann–Whitney U, Tukey HSD post-hoc** | §19, §19B |
+| 11 | **Always a full run** — no quick-test/smoke-test mode | §2 |
 
 **Models (16):** ResNet50V2, ResNet101, DenseNet121, DenseNet169, InceptionV3, Inception-ResNetV2,
 MobileNetV1, MobileNetV2, EfficientNetB0, EfficientNetB3, VGG16, VGG19, ViT-Base, Swin-Transformer,
@@ -50,7 +59,9 @@ md(r"""## §0 · How to run this notebook without crashing
 > **Expected time (full run, A100/L4):** dataset split + augmentation + U-Net training + full-dataset
 > segmentation are a few minutes; the 16-model benchmark (§10) is the long pole — budget a few
 > hours; the unfreeze sweep (§20) and ablation (§21) add roughly ~13 shorter trainings on the 2 best
-> models. Set `QUICK_TEST = True` first for a ~10-minute smoke test of the whole notebook.
+> models. **This notebook always runs the full paper-grade configuration** (≤200 epochs, early
+> stopping, full data, no quick-test/smoke-test shortcut) so every number and figure it produces is
+> the one to cite.
 """)
 
 # ============================================================================================
@@ -69,7 +80,7 @@ except Exception as e:
 
 # --- Pinned dependencies ---
 # timm>=1.0 is required so that 'mobilenetv1_100' (true MobileNet-V1) is available.
-!pip install -q "timm>=1.0.11" "grad-cam>=1.5.0" "scikit-image>=0.21" "albumentations>=1.4" scikit-learn seaborn pandas opencv-python-headless tqdm thop
+!pip install -q "timm>=1.0.11" "grad-cam>=1.5.0" "scikit-image>=0.21" "albumentations>=1.4" scikit-learn statsmodels seaborn pandas opencv-python-headless tqdm thop
 print("Setup complete. If Colab asks to RESTART the runtime, restart and re-run this cell only.")""")
 
 co(r"""import os, sys, time, copy, math, random, glob, json, shutil, warnings, gc, traceback
@@ -143,12 +154,8 @@ CLEAR_CHECKPOINTS = False     # set True once to force a clean retrain (e.g. aft
 SPLIT_RATIOS  = (0.70, 0.15, 0.15)   # train / val / test  (Instruction 2)
 AUG_PER_IMAGE = 3                    # medical-image augmentations generated per TRAIN image (Instruction 3)
 
-# ---- QUICK_TEST: set True ONLY for a fast smoke-test; False = full paper-grade run ----
-QUICK_TEST = False
-if QUICK_TEST:
-    MAX_EPOCHS, PATIENCE, SUBSET = 3, 3, 150       # tiny smoke-test of all 16 models
-else:
-    MAX_EPOCHS, PATIENCE, SUBSET = 200, 20, None   # full reproducible paper run
+# ---- Full paper-grade run only: no quick-test/smoke-test mode ----
+MAX_EPOCHS, PATIENCE, SUBSET = 200, 20, None   # full reproducible paper run, every time
 # ====================================================================
 
 LOCAL_ROOT = "/content/type2_local"       # split, pre-augmentation, pre-segmentation
@@ -166,7 +173,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 print("Classes detected under Type2/:", labels)
-print("Config ready | QUICK_TEST =", QUICK_TEST, "| MAX_EPOCHS =", MAX_EPOCHS,
+print("Config ready | full paper-grade run (no quick-test) | MAX_EPOCHS =", MAX_EPOCHS,
       "| BATCH_SIZE =", BATCH_SIZE, "| device =", device)""")
 
 md(r"""## §2 (utility) · Publication-quality table renderer
@@ -567,7 +574,7 @@ def dice_loss(logits, target, eps=1e-6):
     union = probs.sum(1) + target.sum(1)
     return 1 - ((2*inter + eps) / (union + eps)).mean()
 
-PSEUDO_N_PER_CLASS = 60 if not QUICK_TEST else 20
+PSEUDO_N_PER_CLASS = 60
 
 def build_pseudo_mask_pairs():
     imgs, masks = [], []
@@ -598,7 +605,7 @@ class PseudoMaskDataset(Dataset):
 
 pm_loader = DataLoader(PseudoMaskDataset(PSEUDO_IMGS, PSEUDO_MASKS), batch_size=16, shuffle=True)
 
-UNET_EPOCHS = 15 if not QUICK_TEST else 5
+UNET_EPOCHS = 15
 unet_ckpt = os.path.join(CKPT_DIR, "unet_segmenter.pt")
 unet_model = UNetSmall(base=32).to(device)
 if os.path.exists(unet_ckpt) and not CLEAR_CHECKPOINTS:
@@ -1348,6 +1355,89 @@ for n in BEST2:
     confidence_collage(n, n=10)""")
 
 # ============================================================================================
+# SECTION 17B — MISCLASSIFIED SAMPLES, SEPARATE ANALYSIS
+# ============================================================================================
+md(r"""## §17B · Misclassified test samples — separate analysis with confidence scores
+
+The §17 confidence collage mixes correct and incorrect predictions. This section isolates the
+**wrong ones only**: a per-sample table (true label, predicted label, confidence in each) for the
+2 best models, a dedicated misclassified-only image collage, and a cross-model calibration summary
+(error rate + mean confidence when right vs. wrong) across all 16 models.""")
+
+co(r"""def misclassified_table(name):
+    r = RESULTS[name]
+    yp, yt, ypr, paths = np.array(r["y_pred"]), np.array(r["y_true"]), np.array(r["y_prob"]), r["paths"]
+    wrong = np.where(yp != yt)[0]
+    rows = []
+    for i in wrong:
+        rows.append([os.path.basename(paths[i]), class_short[yt[i]], class_short[yp[i]],
+                    round(float(ypr[i][yp[i]])*100, 2), round(float(ypr[i][yt[i]])*100, 2)])
+    df = pd.DataFrame(rows, columns=["File", "True label", "Predicted label",
+                                     "Confidence in predicted (%)", "Confidence in true (%)"])
+    df = df.sort_values("Confidence in predicted (%)", ascending=False).reset_index(drop=True)
+    df.to_csv(os.path.join(RESULTS_DIR, f"table_misclassified_{name}.csv"), index=False)
+    print(f"\n{name}: {len(df)}/{len(paths)} misclassified test samples ({len(df)/len(paths)*100:.1f}%)")
+    print(df.head(20).to_string(index=False))
+    if len(df):
+        render_df_table(df.head(25), f"Misclassified test samples — {name} (top 25 by confidence)",
+                        f"table_misclassified_{name}.png", fontsize=8,
+                        left_cols=("File", "True label", "Predicted label"))
+    return df
+
+misclass_tables = {n: misclassified_table(n) for n in BEST2}""")
+
+co(r"""def misclassified_collage(name, n=10):
+    r = RESULTS[name]
+    yp, yt, ypr, paths = np.array(r["y_pred"]), np.array(r["y_true"]), np.array(r["y_prob"]), r["paths"]
+    wrong_idx = np.where(yp != yt)[0]
+    if len(wrong_idx) == 0:
+        print(f"{name}: no misclassified test samples — perfect test accuracy, nothing to plot."); return
+    take = wrong_idx[np.random.RandomState(SEED).choice(len(wrong_idx), size=min(n, len(wrong_idx)), replace=False)]
+    rows, cols = 2, 5
+    fig, axes = plt.subplots(rows, cols, figsize=(3.2*cols, 4.3*rows)); axes = axes.ravel()
+    for k, i in enumerate(take):
+        img = load_seg_image(paths[i])
+        conf_pred = ypr[i][yp[i]] * 100
+        conf_true = ypr[i][yt[i]] * 100
+        ax = axes[k]
+        ax.imshow(img); ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"True: {class_short[yt[i]]} ({conf_true:.1f}%)\nPred: {class_short[yp[i]]} ({conf_pred:.1f}%)  ✗",
+                    fontsize=9.5, color="#cf222e", fontweight="bold", linespacing=1.3, pad=8,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cf222e", linewidth=1.5))
+        for s in ax.spines.values():
+            s.set_edgecolor("#cf222e"); s.set_linewidth(3)
+    for j in range(len(take), len(axes)):
+        axes[j].axis("off")
+    fig.suptitle(f"{name} — misclassified test samples only ({len(wrong_idx)} of {len(paths)} total)",
+                fontsize=13.5, fontweight="bold", y=0.99)
+    plt.subplots_adjust(top=0.85, bottom=0.02, hspace=0.6, wspace=0.10)
+    out = os.path.join(FIG_DIR, f"misclassified_collage_{name}.png")
+    plt.savefig(out, dpi=160, bbox_inches="tight"); plt.show(); print("saved:", out)
+
+for n in BEST2:
+    misclassified_collage(n, n=10)""")
+
+co(r"""summary_rows = []
+for n in MODEL_NAMES:
+    if n not in RESULTS: continue
+    r = RESULTS[n]
+    yp, yt, ypr = np.array(r["y_pred"]), np.array(r["y_true"]), np.array(r["y_prob"])
+    wrong = yp != yt
+    n_wrong = int(wrong.sum()); n_total = len(yt)
+    mean_conf_wrong = float(ypr[wrong, yp[wrong]].mean()) * 100 if n_wrong else float("nan")
+    mean_conf_right = float(ypr[~wrong, yp[~wrong]].mean()) * 100 if (~wrong).any() else float("nan")
+    summary_rows.append([n, n_total - n_wrong, n_wrong, round((n_wrong/n_total)*100, 2),
+                         round(mean_conf_wrong, 2) if mean_conf_wrong == mean_conf_wrong else np.nan,
+                         round(mean_conf_right, 2) if mean_conf_right == mean_conf_right else np.nan])
+misclass_summary_df = pd.DataFrame(summary_rows, columns=["Model", "Correct", "Misclassified",
+                                                          "Error rate (%)", "Mean confidence when wrong (%)",
+                                                          "Mean confidence when correct (%)"])
+misclass_summary_df.to_csv(os.path.join(RESULTS_DIR, "table_misclassification_summary_all_models.csv"), index=False)
+print(misclass_summary_df.to_string(index=False))
+render_df_table(misclass_summary_df, "Misclassification summary — all 16 models (error rate & confidence calibration)",
+                "table_misclassification_summary_all_models.png", left_cols=("Model",))""")
+
+# ============================================================================================
 # SECTION 18 — GRAD-CAM
 # ============================================================================================
 md(r"""## §18 · Grad-CAM explainability collages — 2 best models × all 3 classes
@@ -1500,7 +1590,7 @@ co(r"""def unet_contour_features(path, model=None):
                MinValue=float(roi_vals.min()), MaxValue=float(roi_vals.max()), MeanColor=float(roi_vals.mean()),
                Leftmost=float(x), Rightmost=float(x+w), Topmost=float(y), Bottommost=float(y+h))
 
-MORPH_N_PER_CLASS = 40 if not QUICK_TEST else 15
+MORPH_N_PER_CLASS = 40
 feat_records = []
 for ci, cls in enumerate(labels):
     files = sorted(glob.glob(os.path.join(train_dir, cls, "*")))[:MORPH_N_PER_CLASS]
@@ -1547,6 +1637,101 @@ fig.suptitle("Morphological feature distributions per class", fontweight="bold")
 plt.tight_layout(rect=[0,0,1,0.98])
 plt.savefig(os.path.join(FIG_DIR, "morphological_boxplots.png"), dpi=140, bbox_inches="tight")
 plt.show()""")
+
+# ============================================================================================
+# SECTION 19B — EXTENDED STATISTICAL TEST BATTERY
+# ============================================================================================
+md(r"""## §19B · Extended statistical tests on morphological features
+
+§19 already reports one-way **ANOVA** and **Kruskal–Wallis** across all 3 classes. This section
+adds the rest of the standard battery so every assumption and every pairwise comparison is
+documented:
+
+1. **Shapiro–Wilk** normality test — per feature, per class (checks the ANOVA/t-test normality assumption).
+2. **Levene's test** — homogeneity of variance across classes (checks the ANOVA/t-test equal-variance assumption).
+3. **Pairwise Welch's t-test** (does not assume equal variance) between every class pair, per feature, with Bonferroni-corrected p-values.
+4. **Pairwise Mann–Whitney U test** (non-parametric alternative) between every class pair, per feature, with Bonferroni-corrected p-values.
+5. **Tukey HSD post-hoc test** — simultaneous pairwise comparisons with family-wise error control, per feature.""")
+
+co(r"""norm_rows = []
+for f in feat_cols:
+    for ci, cname in enumerate(class_short):
+        vals = feat_df[feat_df.class_idx == ci][f].values
+        if len(vals) >= 3:
+            try:    W, p = scipy_stats.shapiro(vals)
+            except Exception: W, p = np.nan, np.nan
+        else:
+            W, p = np.nan, np.nan
+        norm_rows.append([f, cname, round(W,4) if W==W else np.nan, round(p,4) if p==p else np.nan,
+                          "yes" if (p==p and p>0.05) else "no"])
+normality_df = pd.DataFrame(norm_rows, columns=["Feature","Class","Shapiro-Wilk W","Shapiro-Wilk p",
+                                                "Normal (p>0.05)"])
+normality_df.to_csv(os.path.join(RESULTS_DIR, "table_normality_shapiro.csv"), index=False)
+print("=== Shapiro-Wilk normality test ===")
+print(normality_df.to_string(index=False))
+
+levene_rows = []
+for f in feat_cols:
+    groups = [feat_df[feat_df.class_idx==ci][f].values for ci in range(num_classes)]
+    groups = [g for g in groups if len(g) > 1]
+    try:    Lv, p = scipy_stats.levene(*groups)
+    except Exception: Lv, p = np.nan, np.nan
+    levene_rows.append([f, round(Lv,3) if Lv==Lv else np.nan, round(p,4) if p==p else np.nan,
+                        "yes" if (p==p and p>0.05) else "no"])
+levene_df = pd.DataFrame(levene_rows, columns=["Feature","Levene statistic","Levene p","Equal variance (p>0.05)"])
+levene_df.to_csv(os.path.join(RESULTS_DIR, "table_levene_variance.csv"), index=False)
+print("\n=== Levene's test for homogeneity of variance ===")
+print(levene_df.to_string(index=False))""")
+
+co(r"""from itertools import combinations
+
+n_pairs = num_classes * (num_classes - 1) // 2
+pair_rows = []
+for f in feat_cols:
+    for (ci, cj) in combinations(range(num_classes), 2):
+        a = feat_df[feat_df.class_idx==ci][f].values
+        b = feat_df[feat_df.class_idx==cj][f].values
+        try:    t_stat, t_p = scipy_stats.ttest_ind(a, b, equal_var=False)   # Welch's t-test
+        except Exception: t_stat, t_p = np.nan, np.nan
+        try:    u_stat, u_p = scipy_stats.mannwhitneyu(a, b, alternative="two-sided")
+        except Exception: u_stat, u_p = np.nan, np.nan
+        t_p_bonf = min(1.0, t_p * n_pairs) if t_p == t_p else np.nan
+        u_p_bonf = min(1.0, u_p * n_pairs) if u_p == u_p else np.nan
+        pair_rows.append([f, f"{class_short[ci]} vs {class_short[cj]}",
+                          round(t_stat,3) if t_stat==t_stat else np.nan, round(t_p,4) if t_p==t_p else np.nan,
+                          round(t_p_bonf,4) if t_p_bonf==t_p_bonf else np.nan,
+                          round(u_stat,3) if u_stat==u_stat else np.nan, round(u_p,4) if u_p==u_p else np.nan,
+                          round(u_p_bonf,4) if u_p_bonf==u_p_bonf else np.nan,
+                          "yes" if (t_p_bonf==t_p_bonf and t_p_bonf<0.05) else "no"])
+pairwise_df = pd.DataFrame(pair_rows, columns=["Feature","Class pair","Welch t","t p","t p (Bonferroni)",
+                                               "Mann-Whitney U","MW p","MW p (Bonferroni)",
+                                               "Sig (Bonferroni p<0.05)"])
+pairwise_df.to_csv(os.path.join(RESULTS_DIR, "table_pairwise_ttest_mannwhitney.csv"), index=False)
+print("=== Pairwise Welch t-test & Mann-Whitney U (Bonferroni-corrected) ===")
+print(pairwise_df.to_string(index=False))
+render_df_table(pairwise_df.head(30),
+                "Pairwise class comparisons per feature — Welch t-test & Mann-Whitney U (Bonferroni-corrected, first 30 rows)",
+                "table_pairwise_tests.png", fontsize=7, left_cols=("Feature","Class pair"))""")
+
+co(r"""from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+tukey_rows = []
+for f in feat_cols:
+    try:
+        res = pairwise_tukeyhsd(endog=feat_df[f].values, groups=feat_df["Class"].values, alpha=0.05)
+        for row in res.summary().data[1:]:
+            g1, g2, meandiff, p_adj, lower, upper, reject = row
+            tukey_rows.append([f, f"{g1} vs {g2}", round(float(meandiff),4), round(float(p_adj),4),
+                               round(float(lower),4), round(float(upper),4), bool(reject)])
+    except Exception as e:
+        print(f"  Tukey HSD failed for {f}: {e}")
+tukey_df = pd.DataFrame(tukey_rows, columns=["Feature","Class pair","Mean diff","p (adj)",
+                                             "CI lower","CI upper","Reject H0 (p<0.05)"])
+tukey_df.to_csv(os.path.join(RESULTS_DIR, "table_tukey_hsd.csv"), index=False)
+print("=== Tukey HSD post-hoc pairwise comparisons ===")
+print(tukey_df.to_string(index=False))
+render_df_table(tukey_df.head(30), "Tukey HSD post-hoc pairwise comparisons per feature (first 30 rows)",
+                "table_tukey_hsd.png", fontsize=7, left_cols=("Feature","Class pair"))""")
 
 # ============================================================================================
 # SECTION 20 — UNFREEZE SWEEP
@@ -1828,19 +2013,20 @@ print("Configure GH_TOKEN / GH_REPO / GH_BRANCH above and uncomment to push resu
 
 md(r"""---
 ### Reproducibility & journal-readiness checklist
-1. (Optional) `QUICK_TEST=True` for a fast smoke-test that the full pipeline (split → augment →
-   segment → train 16 models → every figure) runs end-to-end.
-2. **Default `QUICK_TEST=False`** → full paper-grade run (≤200 epochs, early stopping) — the numbers
-   to cite.
-3. Deliverables produced: §2B/§3B dataset-count tables (before/after augmentation) · §5 per-class
+1. **Full paper-grade run only** (≤200 epochs, early stopping, full data) — there is no quick-test
+   / smoke-test shortcut, so every number this notebook produces is the one to cite.
+2. Deliverables produced: §2B/§3B dataset-count tables (before/after augmentation) · §5 per-class
    segmentation collages (4 classical methods + U-Net) · §11 train/val table · §12 avg-metric
    table+bars · §13 class-wise bars+heatmap · §14 learning curves · §16 confusion-matrix collage ·
-   §17 confidence collages · §18 Grad-CAM collages · §19 morphology table+ANOVA/Kruskal+boxplots ·
+   §17 confidence collages · **§17B misclassified-only collage + per-sample confidence table +
+   cross-model calibration summary** · §18 Grad-CAM collages · §19 morphology table +
+   ANOVA/Kruskal-Wallis + boxplots · **§19B normality (Shapiro-Wilk), variance homogeneity
+   (Levene), pairwise Welch t-test, pairwise Mann–Whitney U and Tukey HSD post-hoc tables** ·
    §20 unfreeze sweep · §21 incremental ablation (raw→segmentation→augmentation→weighting→
    smoothing→diff-LR→cross-attention) · §22 time-complexity table · §23 master summary.
-4. Every figure is saved at ≥140 DPI PNG and every table as CSV + rendered PNG under `RESULTS_DIR`
+3. Every figure is saved at ≥140 DPI PNG and every table as CSV + rendered PNG under `RESULTS_DIR`
    — ready to drop into a Q1-journal manuscript.
-5. §24 → push `results/` to GitHub.
+4. §24 → push `results/` to GitHub.
 """)
 
 nb = new_notebook(cells=cells)

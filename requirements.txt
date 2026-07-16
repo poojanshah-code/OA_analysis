@@ -16,5 +16,6 @@ tqdm
 Pillow
 thop
 
-# Augmentation (notebooks/05_type2_segmentation_classification.ipynb)
+# Augmentation & extended statistics (notebooks/05_type2_segmentation_classification.ipynb)
 albumentations>=1.4
+statsmodels
