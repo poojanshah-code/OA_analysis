@@ -315,7 +315,13 @@ mild **geometric** (horizontal flip, ±15° rotation, small scale/translation), 
 (brightness/contrast, gamma, CLAHE), **noise/blur/sharpen**, and **elastic/grid deformation**
 (a staple of medical-image augmentation since the original U-Net paper). Applied only to the
 **training split** — validation/test stay untouched so evaluation remains unbiased — and written
-to a sibling `train_aug/` folder so the raw vs. augmented counts stay individually inspectable.""")
+to a sibling `train_aug/` folder so the raw vs. augmented counts stay individually inspectable.
+
+**Resumable per file:** re-running this cell (e.g. after a disconnect, or simply re-running the
+notebook later in the same session) never regenerates an augmented image that's already on disk —
+each `<stem>_aug{k}.png` is checked individually, so only genuinely missing variants are created.
+If every image was already augmented in an earlier run, this cell just reports that and finishes
+immediately.""")
 
 co(r"""def medical_aug_pipeline():
     return A.Compose([
@@ -341,23 +347,35 @@ AUG = medical_aug_pipeline()
 train_aug_dir = os.path.join(LOCAL_ROOT, "train_aug")
 
 def augment_split(src_dir, dst_dir, per_image=AUG_PER_IMAGE):
+    # Resumable per (source file, variant index): only the "<stem>_aug{k}.png" files that are
+    # not already on disk get generated. This means images already augmented in an earlier run
+    # (this session, or an earlier cell run) are NEVER regenerated -- re-running this cell after
+    # a disconnect, a partial run, or a couple of unreadable source images only tops up what's
+    # actually missing instead of redoing the whole class from scratch.
     made = {}
     for c in labels:
         src = os.path.join(src_dir, c); dst = os.path.join(dst_dir, c)
         os.makedirs(dst, exist_ok=True)
         files = sorted(glob.glob(os.path.join(src, "*")))
-        if len(glob.glob(os.path.join(dst, "*"))) >= len(files) * per_image:
-            made[c] = len(glob.glob(os.path.join(dst, "*"))); continue
+        n_new, n_skip = 0, 0
         for fp in tqdm(files, desc=f"augment {c}", leave=False):
+            stem = os.path.splitext(os.path.basename(fp))[0]
+            missing_k = [k for k in range(per_image)
+                        if not os.path.exists(os.path.join(dst, f"{stem}_aug{k}.png"))]
+            if not missing_k:
+                n_skip += 1
+                continue
             img = cv2.imdecode(np.fromfile(fp, np.uint8), cv2.IMREAD_UNCHANGED)
             if img is None: continue
             if img.ndim == 2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            stem = os.path.splitext(os.path.basename(fp))[0]
-            for k in range(per_image):
+            for k in missing_k:
                 out_img = AUG(image=img[:, :, :3])["image"]
                 out_path = os.path.join(dst, f"{stem}_aug{k}.png")
                 cv2.imencode(".png", out_img)[1].tofile(out_path)
+                n_new += 1
         made[c] = len(glob.glob(os.path.join(dst, "*")))
+        print(f"  {c}: {n_skip}/{len(files)} source images already fully augmented (skipped), "
+              f"{n_new} new augmented images written")
     return made
 
 aug_counts = augment_split(train_dir, train_aug_dir)
